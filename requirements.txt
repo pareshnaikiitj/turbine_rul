@@ -1,0 +1,44 @@
+# Turbine RUL Prediction — M25DE2039
+# Phase 1 dependencies (single parameter — temperature)
+# Uncomment lower sections as you add phases
+
+# ── Core ────────────────────────────────────────────────
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+scipy>=1.10
+
+# ── Gradient Boosting (Layer 2 of ensemble) ─────────────
+xgboost>=1.7
+
+# ── Deep Learning (Layer 3 of ensemble) ─────────────────
+torch>=2.0          # PyTorch — install separately via pytorch.org for GPU
+
+# ── AutoML (Three-Layer Stacked Ensemble) ───────────────
+# autogluon>=0.8    # Uncomment when ready for AutoGluon training
+                    # Install: pip install autogluon
+
+# ── HPO & Tuning ────────────────────────────────────────
+# optuna>=3.0       # Uncomment Phase 3: Bayesian HPO
+# ray[tune]>=2.0    # Uncomment Phase 3: Distributed HPO
+
+# ── Feature Engineering ─────────────────────────────────
+# tsfresh>=0.19     # Uncomment Phase 2: Automated time-series features
+# featuretools>=1.0 # Uncomment Phase 2: Deep feature synthesis
+
+# ── Data Engineering / Streaming ────────────────────────
+# kafka-python>=2.0 # Uncomment Phase 4: Real-time sensor ingestion
+# influxdb-client   # Uncomment Phase 4: Time-series DB storage
+
+# ── MLOps & Serving ─────────────────────────────────────
+# mlflow>=2.0       # Uncomment Phase 5: Experiment tracking
+# fastapi>=0.100    # Uncomment Phase 5: REST API deployment
+# uvicorn>=0.22     # Uncomment Phase 5: ASGI server
+
+# ── Visualization ───────────────────────────────────────
+matplotlib>=3.7
+seaborn>=0.12
+
+# ── Notebooks ───────────────────────────────────────────
+jupyter>=1.0
+ipykernel
