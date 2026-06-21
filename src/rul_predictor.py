@@ -14,7 +14,6 @@ import sys
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
 import logging
@@ -48,9 +47,11 @@ except Exception:
     console_handler = logging.StreamHandler()
 
 console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+console_handler.setLevel(logging.CRITICAL)
 
 # File handler with explicit UTF-8 encoding
 file_handler = logging.FileHandler("logs/rul_training.log", encoding="utf-8")
+file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 
 # Replace any existing handlers with our UTF-8 handlers
@@ -78,6 +79,7 @@ CONFIG = {
     # ── DATA ────────────────────────────────────────────────────────────
     "data_path": "data/raw/turbine_sensor_data.csv",
     "processed_path": "data/processed/features.csv",
+    "predictions_path": "data/processed/latest_unit_predictions.csv",
     "test_size": 0.2,
     "random_state": 42,
 
@@ -236,16 +238,74 @@ def run_baselines(X_train, X_test, y_train, y_test):
     except ImportError:
         log.warning("XGBoost not installed. Skipping.")
 
-    log.info("\n-- Baseline Results ------------------------------")
-    for model, m in results.items():
-        log.info(f"  {model:20s}  MAE={m['mae']:.2f}  RMSE={m['rmse']:.2f}")
-    log.info("--------------------------------------------------\n")
+    trained_models = {
+        "LinearRegression": lr,
+        "RandomForest": rf,
+    }
+    if "XGBoost" in results:
+        trained_models["XGBoost"] = xgb
 
-    return results
+    return results, trained_models
 
 
 # ─────────────────────────────────────────────
-# 5. Three-Layer Stacked Ensemble (AutoGluon)
+# 5. Selected Model Summary
+# ─────────────────────────────────────────────
+
+def display_selected_model_results(model, model_name: str, X_test, y_test, df: pd.DataFrame, n_units: int = 10):
+    """Print the selected model performance and sample remaining-life predictions."""
+    y_pred = model.predict(X_test)
+    metrics = _metrics(y_test, y_pred)
+
+    print("\n=== Turbine Remaining Useful Life Prediction ===")
+    print(f"Selected model: {model_name}")
+    print(f"Test MAE: {metrics['mae']:.2f} hours")
+    print(f"Test RMSE: {metrics['rmse']:.2f} hours")
+    print(f"Test R2: {metrics['r2']:.4f}")
+
+    feature_cols = [c for c in df.columns if c not in ["unit_id", "cycle", CONFIG["target"]]]
+    current = (
+        df[df[CONFIG["target"]] > 0]
+          .sort_values(["unit_id", "cycle"])
+          .groupby("unit_id", as_index=False)
+          .last()
+    )
+    current["actual_remaining_hours"] = current[CONFIG["target"]]
+    current["predicted_remaining_hours"] = np.round(model.predict(current[feature_cols]), 2)
+    current["predicted_remaining_cycles"] = np.maximum(0, np.ceil(current["predicted_remaining_hours"])).astype(int)
+
+    print("\nPredicted remaining life at the last non-failure observed cycle for each turbine unit:")
+    print(current[["unit_id", "cycle", "actual_remaining_hours", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_string(index=False))
+    os.makedirs(os.path.dirname(CONFIG["predictions_path"]), exist_ok=True)
+    current[["unit_id", "cycle", "actual_remaining_hours", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_csv(
+        CONFIG["predictions_path"], index=False
+    )
+    print(f"\nSaved last non-failure predicted remaining life to {CONFIG['predictions_path']}")
+    print("\nNote: This table uses the last observed cycle before failure for each turbine, so predicted remaining life is measured from a non-zero actual RUL point.")
+
+
+def display_current_unit_remaining_life(model, df: pd.DataFrame, model_name: str = "Model", n_units: int = 10):
+    """Show predicted remaining life hours for each turbine at the last observed cycle."""
+    feature_cols = [c for c in df.columns if c not in ["unit_id", "cycle", CONFIG["target"]]]
+    current = (
+        df.sort_values(["unit_id", "cycle"])
+          .groupby("unit_id", as_index=False)
+          .last()
+    )
+
+    y_pred = model.predict(current[feature_cols])
+    current["predicted_remaining_hours"] = np.round(y_pred, 2)
+
+    log.info(f"\n-- {model_name} Predicted Remaining Hours at Latest Cycle --")
+    for _, row in current.head(n_units).iterrows():
+        log.info(
+            f"  Unit {int(row['unit_id'])}: latest cycle={int(row['cycle'])}, actual remaining hours={row[CONFIG['target']]:.2f}, predicted remaining hours={row['predicted_remaining_hours']:.2f}"
+        )
+    log.info("--------------------------------------------------\n")
+
+
+# ─────────────────────────────────────────────
+# 6. Three-Layer Stacked Ensemble (AutoGluon)
 #    Layer 1 → Random Forest       (base learner)
 #    Layer 2 → XGBoost             (residual corrector — OOF predictions)
 #    Layer 3 → PyTorch Neural Net  (deep learner — OOF predictions)
@@ -255,7 +315,6 @@ def train_autogluon(X_train, y_train, X_test, y_test):
     try:
         from autogluon.tabular import TabularPredictor
     except ImportError:
-        log.error("AutoGluon not installed. Run: pip install autogluon")
         return None
 
     train_df = X_train.copy()
@@ -326,10 +385,20 @@ def main():
     X_train, X_test, y_train, y_test = split_data(df)
 
     # 4. Baselines (Layer 1 & 2 individual performance)
-    baseline_results = run_baselines(X_train, X_test, y_train, y_test)
+    baseline_results, baseline_models = run_baselines(X_train, X_test, y_train, y_test)
 
-    # 5. Three-Layer Stacked Ensemble via AutoGluon
+    # Select best available model for final predictions
+    best_baseline = min(baseline_results, key=lambda name: baseline_results[name]["rmse"])
+
     predictor = train_autogluon(X_train, y_train, X_test, y_test)
+    if predictor is not None:
+        selected_model = predictor
+        selected_name = "AutoGluon"
+    else:
+        selected_model = baseline_models[best_baseline]
+        selected_name = best_baseline
+
+    display_selected_model_results(selected_model, selected_name, X_test, y_test, df)
 
     log.info("Phase 1 complete. Add more parameters in CONFIG['input_features'].")
 
