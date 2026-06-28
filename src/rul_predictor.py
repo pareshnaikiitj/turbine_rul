@@ -275,9 +275,9 @@ def display_selected_model_results(model, model_name: str, X_test, y_test, df: p
     current["predicted_remaining_cycles"] = np.maximum(0, np.ceil(current["predicted_remaining_hours"])).astype(int)
 
     print("\nPredicted remaining life at the last non-failure observed cycle for each turbine unit:")
-    print(current[["unit_id", "cycle", "actual_remaining_hours", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_string(index=False))
+    print(current[["unit_id", "cycle", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_string(index=False))
     os.makedirs(os.path.dirname(CONFIG["predictions_path"]), exist_ok=True)
-    current[["unit_id", "cycle", "actual_remaining_hours", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_csv(
+    current[["unit_id", "cycle", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_csv(
         CONFIG["predictions_path"], index=False
     )
     print(f"\nSaved last non-failure predicted remaining life to {CONFIG['predictions_path']}")
