@@ -6,19 +6,25 @@ Author   : Paresh Naik | Roll No: M25DE2039
 Guide    : Dr. Ambuj Kumar Gautam
 Branch   : Data Engineering (M.Tech)
 
-Stage    : Phase 1 — Single Parameter (Temperature)
-Later    : Add vibration, pressure, RPM, etc.
+Stage    : Phase 1 — Single Parameter (RPM,Temperature)
+Later    : Add vibration, pressure, etc.
 """
 
 import sys
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
 import logging
 import os
 import io
+import time
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import contextlib
+
+from config import CONFIG
 
 warnings.filterwarnings("ignore")
 
@@ -33,115 +39,85 @@ os.makedirs("logs", exist_ok=True)
 # ─────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────
-# Create UTF-8 aware logging handlers for console and file to avoid
-# UnicodeEncodeError on Windows consoles using legacy encodings.
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
-# Console handler (wrap binary buffer with TextIOWrapper forcing utf-8)
-try:
-    utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
-    console_handler = logging.StreamHandler(stream=utf8_stdout)
-except Exception:
-    # Fallback to default StreamHandler if wrapping fails
-    console_handler = logging.StreamHandler()
-
-console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-console_handler.setLevel(logging.CRITICAL)
-
-# File handler with explicit UTF-8 encoding
 file_handler = logging.FileHandler("logs/rul_training.log", encoding="utf-8")
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 
-# Replace any existing handlers with our UTF-8 handlers
 root_logger.handlers = []
-root_logger.addHandler(console_handler)
 root_logger.addHandler(file_handler)
 
 log = logging.getLogger(__name__)
 
+# Reduce console/noise from noisy third-party libraries; keep logs only in the file handler above.
+logging.captureWarnings(True)
+for noisy in ("autogluon", "lightgbm", "xgboost", "ray", "fastai", "matplotlib"):
+    nl = logging.getLogger(noisy)
+    nl.handlers = []
+    nl.setLevel(logging.WARNING)
+    nl.propagate = False
 
-# ─────────────────────────────────────────────
-# Config — add more parameters here later
-# ─────────────────────────────────────────────
-CONFIG = {
-    # ── ACTIVE PARAMETER (Phase 1) ──────────────────────────────────────
-    "input_features": [
-        "temperature",          # °C — turbine blade surface temperature
-        # "vibration",          # ← uncomment when adding Phase 2
-        # "pressure",           # ← uncomment when adding Phase 3
-        # "rpm",                # ← uncomment when adding Phase 4
-        # "torque",             # ← uncomment when adding Phase 5
-    ],
-    "target": "rul",            # Remaining Useful Life (hours)
 
-    # ── DATA ────────────────────────────────────────────────────────────
-    "data_path": "data/raw/turbine_sensor_data.csv",
-    "processed_path": "data/processed/features.csv",
-    "predictions_path": "data/processed/latest_unit_predictions.csv",
-    "test_size": 0.2,
-    "random_state": 42,
-
-    # ── ROLLING WINDOW FEATURES ─────────────────────────────────────────
-    "rolling_windows": [5, 10, 20],   # rolling mean/std window sizes
-
-    # ── AutoGluon (Three-Layer Stacked Ensemble) ─────────────────────────
-    "autogluon": {
-        "time_limit": 120,            # seconds for training (increase later)
-        "presets": "medium_quality",  # options: medium_quality, good_quality, best_quality
-        "verbosity": 1,
-    },
-
-    # ── PATHS ────────────────────────────────────────────────────────────
-    "model_dir": "models/autogluon_rul",
-}
+# Fresh random seed for every execution so output changes each run.
+RUN_SEED = int(time.time_ns() % (2**32 - 1))
+CONFIG["random_state"] = RUN_SEED
 
 
 # ─────────────────────────────────────────────
-# 1. Data Generator (Synthetic — replace with real IIoT data)
+# 1. Load paper-based turbine data
 # ─────────────────────────────────────────────
-def generate_synthetic_data(n_samples: int = 2000, save: bool = True) -> pd.DataFrame:
+def build_paper_dataset() -> pd.DataFrame:
     """
-    Simulate turbine sensor readings with a single parameter: temperature.
-
-    Real degradation pattern:
-      - Temperature rises gradually as blade wears
-      - RUL decreases linearly, with noise
-    Replace this function with actual CMAPSS or IIoT CSV loader later.
+    Build a journal-paper-based turbine dataset from the reported operating points
+    and healthy blade ranges in the cited paper.
     """
-    np.random.seed(CONFIG["random_state"])
+    healthy = CONFIG["healthy_ranges"]
+    paper = CONFIG["source_paper"]
 
-    # Simulate 10 turbine units degrading over time
-    units, cycles = [], []
-    temperatures, ruls = [], []
+    rng = np.random.default_rng(CONFIG["random_state"])
+    cases = [
+        {"unit_id": 1, "rpm": paper["reported_rpm"], "temp_start": 900, "temp_end": 1000, "life": 120},
+        {"unit_id": 2, "rpm": 6200, "temp_start": 910, "temp_end": 1000, "life": 110},
+        {"unit_id": 3, "rpm": 5800, "temp_start": 900, "temp_end": 970, "life": 130},
+        {"unit_id": 4, "rpm": 6500, "temp_start": 920, "temp_end": 1000, "life": 100},
+        {"unit_id": 5, "rpm": 5500, "temp_start": 900, "temp_end": 960, "life": 140},
+        {"unit_id": 6, "rpm": 6000, "temp_start": 940, "temp_end": 1000, "life": 90},
+        {"unit_id": 7, "rpm": 6100, "temp_start": 930, "temp_end": 995, "life": 115},
+        {"unit_id": 8, "rpm": 6300, "temp_start": 950, "temp_end": 1000, "life": 105},
+    ]
 
-    for unit_id in range(1, 11):
-        total_life = np.random.randint(150, 300)     # each unit has different lifespan
-        for cycle in range(1, total_life + 1):
-            degradation = cycle / total_life          # 0 → 1 as it degrades
-            # Temperature rises from ~600°C to ~950°C as blade degrades
-            temp = 600 + (350 * degradation) + np.random.normal(0, 8)
-            rul = total_life - cycle                  # hours remaining
+    rows = []
+    for case in cases:
+        unit_id = case["unit_id"]
+        life = case["life"]
+        for cycle in range(1, life + 1):
+            degradation = cycle / life
+            rpm_noise = rng.normal(0, 35)
+            rpm = float(np.clip(case["rpm"] + rpm_noise, healthy["rpm"]["min"], healthy["rpm"]["max"]))
+            temperature_noise = rng.normal(0, 2.5)
+            temperature = case["temp_start"] + (case["temp_end"] - case["temp_start"]) * degradation + temperature_noise
+            temperature = float(np.clip(temperature, healthy["temperature"]["min"], healthy["temperature"]["max"]))
+            rul = max(0, life - cycle)
+            rows.append({
+                "unit_id": unit_id,
+                "cycle": cycle,
+                "rpm": round(rpm, 2),
+                "temperature": round(temperature, 2),
+                "rul": int(rul),
+            })
 
-            units.append(unit_id)
-            cycles.append(cycle)
-            temperatures.append(round(temp, 2))
-            ruls.append(rul)
-
-    df = pd.DataFrame({
-        "unit_id": units,
-        "cycle": cycles,
-        "temperature": temperatures,
-        "rul": ruls,
-    })
-
-    if save:
-        os.makedirs("data/raw", exist_ok=True)
-        df.to_csv(CONFIG["data_path"], index=False)
-        log.info(f"Synthetic data saved → {CONFIG['data_path']}  ({len(df)} rows)")
-
+    df = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(CONFIG["journal_data_path"]), exist_ok=True)
+    df.to_csv(CONFIG["journal_data_path"], index=False)
+    log.info(f"Built journal-paper turbine dataset at {CONFIG['journal_data_path']} ({len(df)} rows)")
     return df
+
+
+def load_paper_dataset() -> pd.DataFrame:
+    """Always rebuild the dataset so each run produces different turbine values."""
+    return build_paper_dataset()
 
 
 # ─────────────────────────────────────────────
@@ -151,7 +127,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create rolling statistical features from the active input parameter(s).
     Sorted by unit → cycle to preserve time-series order.
-    Auto-scales as more parameters are added to CONFIG["input_features"].
     """
     df = df.sort_values(["unit_id", "cycle"]).reset_index(drop=True)
 
@@ -166,193 +141,318 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
                 .transform(lambda x: x.rolling(w, min_periods=1).std().fillna(0))
             )
 
-        # Lag features (previous cycle value)
         df[f"{feat}_lag1"] = df.groupby("unit_id")[feat].shift(1).bfill()
-
-        # Rate of change
         df[f"{feat}_diff"] = df.groupby("unit_id")[feat].diff().fillna(0)
 
-    # Cumulative Damage Index (CDI) proxy — phase 1: based on temperature alone
-    # CDI = normalized cumulative temperature deviation from baseline (600°C)
-    df["cdi"] = df.groupby("unit_id")["temperature"].transform(
-        lambda x: ((x - 600).clip(lower=0).cumsum() / ((x - 600).clip(lower=0).cumsum().max() + 1e-9))
+    baseline_temp = CONFIG["healthy_ranges"]["temperature"]["nominal"]
+    baseline_rpm = CONFIG["healthy_ranges"]["rpm"]["nominal"]
+    df["cdi"] = (
+        df.groupby("unit_id")["temperature"].transform(lambda x: ((x - baseline_temp).clip(lower=0).cumsum()))
+        + df.groupby("unit_id")["rpm"].transform(lambda x: ((x - baseline_rpm).abs().cumsum()))
     )
+    df["cdi"] = df["cdi"] / (df["cdi"].max() + 1e-9)
 
     log.info(f"Features engineered. Shape: {df.shape}")
     return df
 
 
 # ─────────────────────────────────────────────
-# 3. Train / Test Split
+# 3. Train / Test Split (by whole unit — no leakage)
 # ─────────────────────────────────────────────
 def split_data(df: pd.DataFrame):
-    """Split preserving unit boundaries (no data leakage across units)."""
+    """
+    Split by whole turbine unit_id, not by row. This keeps every cycle of a
+    given unit entirely in either train or test, preventing the model from
+    seeing a turbine's other cycles during training.
+    """
     drop_cols = ["unit_id", "cycle", CONFIG["target"]]
     feature_cols = [c for c in df.columns if c not in drop_cols]
 
-    X = df[feature_cols]
-    y = df[CONFIG["target"]]
+    unit_ids = df["unit_id"].unique()
+    rng = np.random.default_rng(CONFIG["random_state"])
+    rng.shuffle(unit_ids)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=CONFIG["test_size"],
-        random_state=CONFIG["random_state"],
-        shuffle=True,
-    )
-    log.info(f"Train: {X_train.shape}  |  Test: {X_test.shape}")
+    n_test_units = max(1, int(round(len(unit_ids) * CONFIG["test_size"])))
+    test_units = set(unit_ids[:n_test_units])
+    train_units = set(unit_ids[n_test_units:])
+
+    train_df = df[df["unit_id"].isin(train_units)].reset_index(drop=True)
+    test_df = df[df["unit_id"].isin(test_units)].reset_index(drop=True)
+
+    X_train, y_train = train_df[feature_cols], train_df[CONFIG["target"]]
+    X_test, y_test = test_df[feature_cols], test_df[CONFIG["target"]]
+
+    log.info(f"Train units: {sorted(train_units)}  ({X_train.shape})")
+    log.info(f"Test units:  {sorted(test_units)}  ({X_test.shape})")
     return X_train, X_test, y_train, y_test
 
 
 # ─────────────────────────────────────────────
-# 4. Baseline Models (before AutoGluon)
+# 4. Final Model — AutoGluon Three-Layer Stacked Ensemble
+#    Layer 1 → Random Forest       (base learner)
+#    Layer 2 → XGBoost             (residual corrector — OOF predictions)
+#    Layer 3 → PyTorch Neural Net  (deep learner — OOF predictions)
+#              └─ Weighted Ensemble → RUL Prediction (hours)
+#
+#    This single model produces the "Turbine Remaining Useful Life
+#    Prediction" result. 
 # ─────────────────────────────────────────────
-def run_baselines(X_train, X_test, y_train, y_test):
-    """
-    Quick baselines: Random Forest, XGBoost, Linear Regression.
-    These form the comparison for the AutoGluon stacked ensemble.
-    """
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.linear_model import LinearRegression
-
-    results = {}
-
-    # Linear Regression baseline
-    lr = LinearRegression()
-    lr.fit(X_train, y_train)
-    y_pred = lr.predict(X_test)
-    results["LinearRegression"] = _metrics(y_test, y_pred)
-
-    # Random Forest (Layer 1 of the stacked ensemble)
-    rf = RandomForestRegressor(n_estimators=100, random_state=CONFIG["random_state"], n_jobs=-1)
-    rf.fit(X_train, y_train)
-    y_pred = rf.predict(X_test)
-    results["RandomForest"] = _metrics(y_test, y_pred)
-
-    # XGBoost (Layer 2 of the stacked ensemble)
+def train_final_model(X_train, y_train, X_test, y_test):
+    """Returns (model_name, predict_fn, metrics)."""
+    # Try importing and running AutoGluon inside a suppression context so
+    # its stdout/stderr prints don't appear in the console.
     try:
-        from xgboost import XGBRegressor
-        xgb = XGBRegressor(n_estimators=100, random_state=CONFIG["random_state"], verbosity=0)
-        xgb.fit(X_train, y_train)
-        y_pred = xgb.predict(X_test)
-        results["XGBoost"] = _metrics(y_test, y_pred)
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                from autogluon.tabular import TabularPredictor
+
+                train_df = X_train.copy()
+                train_df["rul"] = y_train.values
+                cfg = CONFIG["autogluon"]
+
+                log.info("Starting AutoGluon three-layer stacked ensemble training...")
+                predictor = TabularPredictor(
+                    label="rul",
+                    problem_type="regression",
+                    eval_metric="root_mean_squared_error",
+                    path=CONFIG["model_dir"],
+                ).fit(
+                    train_data=train_df,
+                    time_limit=cfg["time_limit"],
+                    presets=cfg["presets"],
+                    verbosity=cfg["verbosity"],
+                    num_stack_levels=2,       # 3-layer stacking: base → L1 → L2 meta
+                    num_bag_folds=5,          # out-of-fold predictions between layers
+                )
     except ImportError:
-        log.warning("XGBoost not installed. Skipping.")
+        from sklearn.ensemble import RandomForestRegressor
 
-    trained_models = {
-        "LinearRegression": lr,
-        "RandomForest": rf,
-    }
-    if "XGBoost" in results:
-        trained_models["XGBoost"] = xgb
+        rf = RandomForestRegressor(n_estimators=200, random_state=CONFIG["random_state"], n_jobs=-1)
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        metrics = _metrics(y_test, y_pred)
+        return "RandomForest", rf.predict, metrics
+    except Exception:
+        # If AutoGluon fails for any reason inside the suppressed block,
+        # log the exception and fallback to RandomForest.
+        log.exception("AutoGluon training failed; falling back to RandomForest")
+        from sklearn.ensemble import RandomForestRegressor
 
-    return results, trained_models
+        rf = RandomForestRegressor(n_estimators=200, random_state=CONFIG["random_state"], n_jobs=-1)
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        metrics = _metrics(y_test, y_pred)
+        return "RandomForest", rf.predict, metrics
 
+    train_df = X_train.copy()
+    train_df["rul"] = y_train.values
+    cfg = CONFIG["autogluon"]
 
-# ─────────────────────────────────────────────
-# 5. Selected Model Summary
-# ─────────────────────────────────────────────
+    log.info("Starting AutoGluon three-layer stacked ensemble training...")
+    # TabularPredictor emits many prints/warnings to stdout/stderr; suppress them
+    # so the console remains quiet and all logs go to the logfile.
+    try:
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                predictor = TabularPredictor(
+                    label="rul",
+                    problem_type="regression",
+                    eval_metric="root_mean_squared_error",
+                    path=CONFIG["model_dir"],
+                ).fit(
+                    train_data=train_df,
+                    time_limit=cfg["time_limit"],
+                    presets=cfg["presets"],
+                    verbosity=cfg["verbosity"],
+                    num_stack_levels=2,       # 3-layer stacking: base → L1 → L2 meta
+                    num_bag_folds=5,          # out-of-fold predictions between layers
+                )
+    except Exception:
+        # If AutoGluon fails for any reason, fallback to RandomForest
+        log.exception("AutoGluon training failed; falling back to RandomForest")
+        from sklearn.ensemble import RandomForestRegressor
 
-def display_selected_model_results(model, model_name: str, X_test, y_test, df: pd.DataFrame, n_units: int = 10):
-    """Print the selected model performance and sample remaining-life predictions."""
-    y_pred = model.predict(X_test)
+        rf = RandomForestRegressor(n_estimators=200, random_state=CONFIG["random_state"], n_jobs=-1)
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+        metrics = _metrics(y_test, y_pred)
+        return "RandomForest", rf.predict, metrics
+
+    y_pred = np.asarray(predictor.predict(X_test))
     metrics = _metrics(y_test, y_pred)
 
+    def predict_fn(X):
+        return np.asarray(predictor.predict(X))
+
+    return "AutoGluon (3-Layer Stacked Ensemble)", predict_fn, metrics
+
+
+# ─────────────────────────────────────────────
+# 5. Display + Example Predictions (single model, single output column)
+# ─────────────────────────────────────────────
+def display_final_model_results(model_name: str, metrics: dict):
+    """Single combined block — replaces the old separate LR/RF/XGBoost prints."""
     print("\n=== Turbine Remaining Useful Life Prediction ===")
     print(f"Selected model: {model_name}")
     print(f"Test MAE: {metrics['mae']:.2f} hours")
     print(f"Test RMSE: {metrics['rmse']:.2f} hours")
     print(f"Test R2: {metrics['r2']:.4f}")
 
-    feature_cols = [c for c in df.columns if c not in ["unit_id", "cycle", CONFIG["target"]]]
-    current = (
-        df[df[CONFIG["target"]] > 0]
-          .sort_values(["unit_id", "cycle"])
-          .groupby("unit_id", as_index=False)
-          .last()
+
+def build_simple_trend_models(df: pd.DataFrame):
+    """Train lightweight trend models for RPM and temperature so the output can show predicted values."""
+    from sklearn.linear_model import LinearRegression
+
+    feature_df = df[["unit_id", "cycle", "rpm", "temperature"]].copy()
+    rpm_model = LinearRegression()
+    temp_model = LinearRegression()
+
+    rpm_model.fit(feature_df[["unit_id", "cycle"]], feature_df["rpm"])
+    temp_model.fit(feature_df[["unit_id", "cycle"]], feature_df["temperature"])
+    return rpm_model, temp_model
+
+
+def predict_for_operating_conditions(predict_fn, feature_cols, df: pd.DataFrame):
+    """Predict RUL for several concrete turbine examples using the single final model."""
+    healthy = CONFIG["healthy_ranges"]
+
+    example_rows = df.head(10).copy()
+    example_rows = example_rows[["unit_id", "cycle", "rpm", "temperature", "rul"]].copy()
+    example_rows = example_rows.rename(columns={"rul": "actual_rul_hours"})
+
+    rpm_model, temp_model = build_simple_trend_models(df)
+
+    rows = []
+    for _, row in example_rows.iterrows():
+        case_df = pd.DataFrame([
+            {
+                "unit_id": int(row["unit_id"]),
+                "cycle": int(row["cycle"]),
+                "rpm": float(row["rpm"]),
+                "temperature": float(row["temperature"]),
+                "rul": 0,
+            }
+        ])
+        case_df = engineer_features(case_df)
+        case_df = case_df[feature_cols].fillna(0)
+
+        pred_rul = float(predict_fn(case_df[feature_cols])[0])
+
+        pred_rpm = float(rpm_model.predict([[int(row["unit_id"]), int(row["cycle"])]])[0])
+        pred_temp = float(temp_model.predict([[int(row["unit_id"]), int(row["cycle"])]])[0])
+
+        rows.append((
+            int(row["unit_id"]),
+            int(row["cycle"]),
+            float(row["rpm"]),
+            round(pred_rpm, 2),
+            float(row["temperature"]),
+            round(pred_temp, 2),
+            float(row["actual_rul_hours"]),
+            round(pred_rul, 2),
+        ))
+
+    out = pd.DataFrame(
+        rows,
+        columns=[
+            "unit_id",
+            "cycle",
+            "actual_rpm",
+            "predicted_rpm",
+            "actual_temperature",
+            "predicted_temperature",
+            "actual_rul_hours",
+            "predicted_rul_hours",
+        ],
     )
-    current["actual_remaining_hours"] = current[CONFIG["target"]]
-    current["predicted_remaining_hours"] = np.round(model.predict(current[feature_cols]), 2)
-    current["predicted_remaining_cycles"] = np.maximum(0, np.ceil(current["predicted_remaining_hours"])).astype(int)
-
-    print("\nPredicted remaining life at the last non-failure observed cycle for each turbine unit:")
-    print(current[["unit_id", "cycle", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_string(index=False))
-    os.makedirs(os.path.dirname(CONFIG["predictions_path"]), exist_ok=True)
-    current[["unit_id", "cycle", "predicted_remaining_hours", "predicted_remaining_cycles"]].to_csv(
-        CONFIG["predictions_path"], index=False
+    print("\n=== Example Turbine RUL Predictions ===")
+    print(f"Paper URL: {CONFIG['source_paper']['url']}")
+    print(
+        f"Healthy range → RPM: {healthy['rpm']['min']} to {healthy['rpm']['max']} | "
+        f"Temperature: {healthy['temperature']['min']} to {healthy['temperature']['max']} K"
     )
-    print(f"\nSaved last non-failure predicted remaining life to {CONFIG['predictions_path']}")
-    print("\nNote: This table uses the last observed cycle before failure for each turbine, so predicted remaining life is measured from a non-zero actual RUL point.")
+    print(out.to_string(index=False))
 
+    print("\nGenerating graphical pattern for the turbine examples...")
+    plot_df = out.head(8).copy()
+    if not plot_df.empty:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
 
-def display_current_unit_remaining_life(model, df: pd.DataFrame, model_name: str = "Model", n_units: int = 10):
-    """Show predicted remaining life hours for each turbine at the last observed cycle."""
-    feature_cols = [c for c in df.columns if c not in ["unit_id", "cycle", CONFIG["target"]]]
-    current = (
-        df.sort_values(["unit_id", "cycle"])
-          .groupby("unit_id", as_index=False)
-          .last()
-    )
+        ax1, ax2 = axes
+        ax1.plot(plot_df["cycle"], plot_df["actual_rpm"], marker="^", linewidth=1.8, color="tab:green", label="Actual RPM")
+        ax1_t = ax1.twinx()
+        ax1_t.plot(plot_df["cycle"], plot_df["predicted_rul_hours"], marker="s", linewidth=1.8, color="tab:red", label="Predicted RUL")
+        ax1.set_title("Turbine RPM and Predicted RUL")
+        ax1.set_ylabel("RPM")
+        ax1_t.set_ylabel("Predicted RUL")
+        ax1.grid(True, alpha=0.3)
 
-    y_pred = model.predict(current[feature_cols])
-    current["predicted_remaining_hours"] = np.round(y_pred, 2)
+        ax2.plot(plot_df["cycle"], plot_df["actual_temperature"], marker="o", linewidth=1.8, color="tab:blue", label="Actual Temperature")
+        ax2_t = ax2.twinx()
+        ax2_t.plot(plot_df["cycle"], plot_df["predicted_rul_hours"], marker="s", linewidth=1.8, color="tab:red", label="Predicted RUL")
+        ax2.set_title("Turbine Temperature and Predicted RUL")
+        ax2.set_xlabel("Cycle")
+        ax2.set_ylabel("Temperature")
+        ax2_t.set_ylabel("Predicted RUL")
+        ax2.grid(True, alpha=0.3)
 
-    log.info(f"\n-- {model_name} Predicted Remaining Hours at Latest Cycle --")
-    for _, row in current.head(n_units).iterrows():
-        log.info(
-            f"  Unit {int(row['unit_id'])}: latest cycle={int(row['cycle'])}, actual remaining hours={row[CONFIG['target']]:.2f}, predicted remaining hours={row['predicted_remaining_hours']:.2f}"
-        )
-    log.info("--------------------------------------------------\n")
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1_t.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
+        lines1, labels1 = ax2.get_legend_handles_labels()
+        lines2, labels2 = ax2_t.get_legend_handles_labels()
+        ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
-# ─────────────────────────────────────────────
-# 6. Three-Layer Stacked Ensemble (AutoGluon)
-#    Layer 1 → Random Forest       (base learner)
-#    Layer 2 → XGBoost             (residual corrector — OOF predictions)
-#    Layer 3 → PyTorch Neural Net  (deep learner — OOF predictions)
-#              └─ Weighted Ensemble → RUL Prediction (hours)
-# ─────────────────────────────────────────────
-def train_autogluon(X_train, y_train, X_test, y_test):
-    try:
-        from autogluon.tabular import TabularPredictor
-    except ImportError:
-        return None
+        fig.tight_layout()
+        plot_path = "data/processed/turbine_trend_plot.png"
+        os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print(f"Saved graphical pattern to {plot_path}")
 
-    train_df = X_train.copy()
-    train_df["rul"] = y_train.values
+        # Also generate a degradation (CDI) plot for the same example units
+        try:
+            deg_plot_path = "data/processed/turbine_degradation_plot.png"
+            units = plot_df["unit_id"].unique()
+            fig2, ax = plt.subplots(figsize=(8, 3 + len(units) * 0.5))
+            for uid in units:
+                unit_df = df[df["unit_id"] == uid]
+                ax.plot(unit_df["cycle"], unit_df["cdi"], marker="o", linewidth=1.5, label=f"Unit {uid}")
+            ax.set_title("Cumulative Degradation Index (CDI) by Cycle")
+            ax.set_xlabel("Cycle")
+            ax.set_ylabel("CDI (normalized)")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+            fig2.tight_layout()
+            fig2.savefig(deg_plot_path, dpi=150)
+            plt.close(fig2)
+            print(f"Saved degradation pattern to {deg_plot_path}")
+        except Exception:
+            log.exception("Failed to generate degradation plot")
 
-    cfg = CONFIG["autogluon"]
+        # Try opening the images on desktop (Windows `os.startfile`), ignore failures
+        try:
+            if os.name == "nt":
+                try:
+                    os.startfile(plot_path)
+                except Exception:
+                    log.debug("Could not open trend plot automatically")
+                try:
+                    os.startfile(deg_plot_path)
+                except Exception:
+                    log.debug("Could not open degradation plot automatically")
+        except Exception:
+            log.debug("Automatic image open skipped or failed")
 
-    log.info("Starting AutoGluon three-layer stacked ensemble training...")
-    predictor = TabularPredictor(
-        label="rul",
-        problem_type="regression",
-        eval_metric="root_mean_squared_error",
-        path=CONFIG["model_dir"],
-    ).fit(
-        train_data=train_df,
-        time_limit=cfg["time_limit"],
-        presets=cfg["presets"],
-        verbosity=cfg["verbosity"],
-        num_stack_levels=2,       # 3-layer stacking: base → L1 → L2 meta
-        num_bag_folds=5,          # out-of-fold predictions between layers
-    )
-
-    y_pred = predictor.predict(X_test)
-    m = _metrics(y_test, y_pred)
-    log.info(f"\n-- AutoGluon Ensemble Results --------------------")
-    log.info(f"  MAE  = {m['mae']:.2f}")
-    log.info(f"  RMSE = {m['rmse']:.2f}")
-    log.info(f"  R2   = {m['r2']:.4f}")
-    log.info(f"--------------------------------------------------\n")
-
-    return predictor
+    return out
 
 
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 def _metrics(y_true, y_pred) -> dict:
-    mae  = mean_absolute_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
@@ -365,42 +465,45 @@ def _metrics(y_true, y_pred) -> dict:
 # ─────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  Turbine RUL Prediction — Phase 1 (Temperature)")
+    log.info("  Turbine RUL Prediction — Paper-based RPM + Temperature")
     log.info("=" * 55)
 
+    healthy = CONFIG["healthy_ranges"]
+    paper = CONFIG["source_paper"]
+    log.info(f"Source paper: {paper['title']} ({paper['journal']})")
+    log.info(f"Run seed: {RUN_SEED}")
+    log.info(
+        f"Healthy blade limits → RPM {healthy['rpm']['min']}-{healthy['rpm']['max']} (nominal {healthy['rpm']['nominal']}) | "
+        f"Temperature {healthy['temperature']['min']}-{healthy['temperature']['max']} K "
+        f"({healthy['temperature']['min']-273.15:.0f}°C-{healthy['temperature']['max']-273.15:.0f}°C; nominal {healthy['temperature']['nominal']-273.15:.0f}°C)"
+    )
+    log.info(
+        f"Reported paper operating point → RPM {paper['reported_rpm']} | Temperature {paper['reported_temperature_k']} K "
+        f"({paper['reported_temperature_c']:.2f}°C)"
+    )
+    log.info(f"Paper URL: {paper['url']}")
+
     # 1. Data
-    if not os.path.exists(CONFIG["data_path"]):
-        log.info("No data file found — generating synthetic data...")
-        df = generate_synthetic_data()
-    else:
-        df = pd.read_csv(CONFIG["data_path"])
-        log.info(f"Loaded data from {CONFIG['data_path']}  ({len(df)} rows)")
+    df = load_paper_dataset()
 
     # 2. Features
     df = engineer_features(df)
     os.makedirs("data/processed", exist_ok=True)
     df.to_csv(CONFIG["processed_path"], index=False)
 
-    # 3. Split
+    # 3. Split — by whole unit, no leakage
     X_train, X_test, y_train, y_test = split_data(df)
 
-    # 4. Baselines (Layer 1 & 2 individual performance)
-    baseline_results, baseline_models = run_baselines(X_train, X_test, y_train, y_test)
+    # 4. Train the single final model (AutoGluon, or RandomForest fallback)
+    model_name, predict_fn, metrics = train_final_model(X_train, y_train, X_test, y_test)
 
-    # Select best available model for final predictions
-    best_baseline = min(baseline_results, key=lambda name: baseline_results[name]["rmse"])
+    # 5. Combined display — one block, one model
+    display_final_model_results(model_name, metrics)
 
-    predictor = train_autogluon(X_train, y_train, X_test, y_test)
-    if predictor is not None:
-        selected_model = predictor
-        selected_name = "AutoGluon"
-    else:
-        selected_model = baseline_models[best_baseline]
-        selected_name = best_baseline
+    feature_cols = list(X_train.columns)
+    predict_for_operating_conditions(predict_fn, feature_cols, df)
 
-    display_selected_model_results(selected_model, selected_name, X_test, y_test, df)
-
-    log.info("Phase 1 complete. Add more parameters in CONFIG['input_features'].")
+    log.info("Paper-based RPM + temperature RUL training complete.")
 
 
 if __name__ == "__main__":
