@@ -19,6 +19,7 @@ sdist/
 var/
 wheels/
 *.whl
+.pytest_cache
 
 # Virtual environments
 .venv/
@@ -53,3 +54,6 @@ desktop.ini
 
 # AutoGluon artifacts
 ag-*
+
+# Plots
+plots
