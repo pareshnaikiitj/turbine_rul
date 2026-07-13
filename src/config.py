@@ -1,9 +1,9 @@
 """Configuration settings for the turbine RUL prediction workflow."""
 
 CONFIG = {
-    # Active parameters (paper-based RPM + Temperature, extended with
-    # vibration / pressure / load for the multi-sensor degradation simulator)
-    "input_features": ["rpm", "temperature", "loading", "time_hours", "vibration", "pressure"],
+    # Active parameters (paper-based RPM + Temperature). Vibration and
+    # pressure have been removed for now — Phase 1 scope only.
+    "input_features": ["rpm", "temperature", "loading", "time_hours"],
     "target": "rul",
 
     # Data paths
@@ -14,14 +14,13 @@ CONFIG = {
     "test_size": 0.2,
     "random_state": 42,
 
-    # Healthy blade operating limits (from paper-based reference)
+    # Healthy blade operating limits (from paper-based reference).
+    # "loading" bounds added so the scenario table can label loading into
+    # Low/Medium/High bands, same as rpm and temperature.
     "healthy_ranges": {
         "rpm": {"min": 3000, "max": 6000, "nominal": 4500},
         "temperature": {"min": 400, "max": 1000, "nominal": 700},
-        # Added so vibration/pressure get the same rolling/lag treatment as
-        # rpm & temperature inside engineer_features().
-        "vibration": {"min": 0.2, "max": 5.0, "nominal": 1.0},
-        "pressure": {"min": 90.0, "max": 110.0, "nominal": 101.325},
+        "loading": {"min": 0.45, "max": 0.95, "nominal": 0.70},
     },
 
     # Source paper reference
@@ -49,27 +48,16 @@ CONFIG = {
 
     # ------------------------------------------------------------------
     # Degradation model constants (Basquin's equation + Palmgren-Miner
-    # cumulative damage rule + centrifugal stress scaling ~ rpm^2)
+    # cumulative damage rule + centrifugal stress scaling ~ rpm^2).
+    # Vibration-based wear term removed along with the vibration sensor.
     # ------------------------------------------------------------------
     "degradation_model": {
-        # Basquin-style exponent (b) governing how sharply hours-to-failure
-        # falls as stress rises. Widened from a textbook metal-fatigue value
-        # so the 3000-6000 rpm operating band produces a usable, non-degenerate
-        # spread of remaining-life estimates instead of many orders of magnitude.
         "basquin_exponent": -0.5,
-        # Non-dimensionalizing stress reference: sigma_a = (rpm / rpm_ref)^2
-        # (centrifugal stress scaling), evaluated against rpm_ref = max rated rpm
-        # so sigma_a tops out at 1.0 for the highest rpm in the operating band.
         "stress_rpm_ref": 6000,
         "fatigue_strength_coefficient": 1.0,
-        # Overall hours-to-failure scale factor (calibrates N_f to a
-        # realistic tens-to-hundreds-of-hours range for this blade class).
         "life_scale_hours": 140,
-        # Thermal stress contributes a smaller, secondary multiplier on the
-        # per-hour damage increment.
+        # Thermal stress is now the only secondary multiplier on damage.
         "thermal_stress_weight": 0.35,
-        # Vibration/bearing-wear contributes a smaller multiplier too.
-        "vibration_stress_weight": 0.20,
     },
 
     # Cumulative damage index at which a blade is considered failed
@@ -80,7 +68,7 @@ CONFIG = {
     # Critical, independent of the raw damage index check above.
     "health_threshold": 25,
 
-    # Health score band for "Warning" status (Warning: health_threshold <
+    # Health score band for "Warning" status (Warning: health_threshold 
     # health <= warning_threshold; Healthy: health > warning_threshold).
     "warning_threshold": 60,
 
