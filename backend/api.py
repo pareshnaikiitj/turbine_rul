@@ -14,7 +14,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173", 
         "http://127.0.0.1:5173", 
+        "https://turbine-rul-id2i-five.vercel.app",
         "https://turbine-rul-id2i-nsh7a0wtb-pareshnaikiitjs-projects.vercel.app"
+        
     ],
     allow_credentials=True,
     allow_methods=["*"],
