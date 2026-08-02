@@ -34,6 +34,7 @@ ENV/
 # Data — raw and processed data are not versioned
 data/raw/
 data/processed/
+data/output/
 
 # Logs
 logs/

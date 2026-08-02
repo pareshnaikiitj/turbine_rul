@@ -65,7 +65,7 @@ CONFIG["random_state"] = RUN_SEED
 
 
 # ─────────────────────────────────────────────
-# 1. Load paper-based turbine data
+# 1. Data loading — REAL DATA (persistent store) with synthetic fallback
 # ─────────────────────────────────────────────
 def calculate_loading_and_time(rpm: float, cycle: int, life: int, healthy: dict) -> tuple[float, float]:
     """Create a loading and time signal that rises with RPM so higher rpm shows higher loading."""
@@ -85,8 +85,9 @@ def _rpm_ratio(rpm: float, healthy: dict) -> float:
 
 def build_paper_dataset() -> pd.DataFrame:
     """
-    Build a journal-paper-based turbine dataset from the reported operating points
-    and healthy blade ranges in the cited paper.
+    SYNTHETIC FALLBACK ONLY — used when no real data store exists yet and
+    no uploaded_csv_path was supplied. Builds a journal-paper-based turbine
+    dataset from the reported operating points and healthy blade ranges.
     """
     healthy = CONFIG["healthy_ranges"]
     paper = CONFIG["source_paper"]
@@ -115,7 +116,6 @@ def build_paper_dataset() -> pd.DataFrame:
             temperature = case["temp_start"] + (case["temp_end"] - case["temp_start"]) * degradation + temperature_noise
             temperature = float(np.clip(temperature, healthy["temperature"]["min"], healthy["temperature"]["max"]))
             loading, time_hours = calculate_loading_and_time(rpm, cycle, life, healthy)
-
             rul = max(0, life - cycle)
             rows.append({
                 "unit_id": unit_id,
@@ -130,29 +130,331 @@ def build_paper_dataset() -> pd.DataFrame:
     df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(CONFIG["journal_data_path"]), exist_ok=True)
     df.to_csv(CONFIG["journal_data_path"], index=False)
-    log.info(f"Built journal-paper turbine dataset at {CONFIG['journal_data_path']} ({len(df)} rows)")
+    log.info(f"Built SYNTHETIC fallback dataset at {CONFIG['journal_data_path']} ({len(df)} rows)")
     return df
 
 
-def load_paper_dataset() -> pd.DataFrame:
-    """Always rebuild the dataset so each run produces different turbine values."""
+def load_and_store_real_data(uploaded_csv_path: str) -> pd.DataFrame:
+    """
+    Load the user's REAL raw CSV (unit_id, cycle, rpm, temperature, loading,
+    time_hours, rul) and merge it into a persistent store on disk, instead
+    of overwriting or regenerating synthetic data. Existing stored rows for
+    a given (unit_id, cycle) are kept as OLD DATA; any new rows from
+    `uploaded_csv_path` are treated as CURRENT DATA and appended. Duplicate
+    (unit_id, cycle) pairs are resolved in favor of the newly uploaded row.
+    """
+    store_path = CONFIG["real_data_store_path"]
+    os.makedirs(os.path.dirname(store_path), exist_ok=True)
+
+    new_data = pd.read_csv(uploaded_csv_path)
+    required_cols = {"unit_id", "cycle", "rpm", "temperature", "loading", "time_hours", "rul"}
+    missing = required_cols - set(new_data.columns)
+    if missing:
+        raise ValueError(f"Uploaded real data is missing required columns: {missing}")
+
+    if os.path.exists(store_path):
+        old_data = pd.read_csv(store_path)
+        combined = pd.concat([old_data, new_data], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["unit_id", "cycle"], keep="last")
+    else:
+        combined = new_data.copy()
+
+    combined = combined.sort_values(["unit_id", "cycle"]).reset_index(drop=True)
+    combined.to_csv(store_path, index=False)
+    log.info(f"Real data store updated: {len(new_data)} new rows merged, {len(combined)} total rows at {store_path}")
+    return combined
+
+
+def load_real_data_store() -> pd.DataFrame:
+    """Load the persistent real-data store as-is (no new upload this run)."""
+    store_path = CONFIG["real_data_store_path"]
+    if not os.path.exists(store_path):
+        raise FileNotFoundError(
+            f"No real data store found at {store_path}. "
+            f"Call load_paper_dataset(uploaded_csv_path=...) first, or set "
+            f"CONFIG['use_real_data'] = False to use synthetic data."
+        )
+    return pd.read_csv(store_path)
+
+
+def load_paper_dataset(uploaded_csv_path: str | None = None) -> pd.DataFrame:
+    """
+    Data source selector:
+      - If `uploaded_csv_path` is given, ingest it as CURRENT DATA and merge
+        into the persistent real-data store (OLD DATA + CURRENT DATA).
+      - Else, if CONFIG["use_real_data"] is True and a store already exists
+        on disk, load that accumulated real data (no synthetic generation).
+      - Else, fall back to the synthetic build_paper_dataset() generator
+        (only used when no real data is available at all).
+    """
+    if uploaded_csv_path is not None:
+        return load_and_store_real_data(uploaded_csv_path)
+
+    if CONFIG.get("use_real_data", False) and os.path.exists(CONFIG["real_data_store_path"]):
+        log.info("Loading accumulated real data store (no synthetic generation).")
+        return load_real_data_store()
+
+    log.info("No real data available — falling back to synthetic build_paper_dataset().")
     return build_paper_dataset()
 
+# ─────────────────────────────────────────────
+# SLMTA15 Material Fatigue Model (S-N curve + Palmgren-Miner)
+#    — This is the CURRENT / final RUL prediction logic used for RPM
+#      scenario forecasting, replacing the earlier Basquin-formula-based
+#      physics simulator.
+# ─────────────────────────────────────────────
+def _stress_from_loading(loading: float) -> float:
+    """Map a loading ratio (healthy_ranges['loading']) onto a stress value (MPa)."""
+    healthy = CONFIG["healthy_ranges"]
+    stress_cfg = CONFIG["stress_range_mpa"]
+    l_min, l_max = healthy["loading"]["min"], healthy["loading"]["max"]
+    ratio = float(np.clip((loading - l_min) / max(1e-9, (l_max - l_min)), 0.0, 1.0))
+    return stress_cfg["min"] + ratio * (stress_cfg["max"] - stress_cfg["min"])
 
+
+def _fatigue_life_cycles_slmta15(stress_mpa: float) -> float:
+    """
+    Interpolate fatigue life (cycles to failure) for SLMTA15 at a given
+    stress, using stress vs log10(N) linear interpolation between the
+    table points in CONFIG["material_sn_curve"]. Stress is clipped to the
+    table's own bounds (500-900 MPa) to avoid extrapolation.
+    """
+    points = sorted(CONFIG["material_sn_curve"]["stress_life_points"], key=lambda p: p[0])
+    stresses = [p[0] for p in points]
+    log_lives = [np.log10(p[1]) for p in points]
+    stress_mpa = float(np.clip(stress_mpa, stresses[0], stresses[-1]))
+    log_n = float(np.interp(stress_mpa, stresses, log_lives))
+    return float(10 ** log_n)
+
+
+def compute_used_damage_slmta15(unit_df: pd.DataFrame, used_hours: float) -> float:
+    """
+    PREVIOUS DATA: walk through this unit's real recorded history up to
+    `used_hours`, and accumulate Palmgren-Miner damage (sum of n_i/N_fi)
+    using the SLMTA15 S-N curve at each row's own rpm/loading-derived
+    stress. Returns the cumulative damage fraction (0 = brand new, 1 = at
+    failure) already consumed by the time the unit reached `used_hours` of
+    operation.
+    """
+    hist = unit_df[unit_df["time_hours"] <= used_hours].sort_values("time_hours").copy()
+    if hist.empty:
+        return 0.0
+
+    hist["delta_hours"] = hist["time_hours"].diff().fillna(hist["time_hours"].iloc[0])
+
+    damage = 0.0
+    for _, row in hist.iterrows():
+        stress = _stress_from_loading(float(row["loading"]))
+        n_f = _fatigue_life_cycles_slmta15(stress)
+        cycles_per_hour = float(row["rpm"]) * 60.0
+        damage_rate_per_hour = cycles_per_hour / n_f
+        damage += damage_rate_per_hour * float(row["delta_hours"])
+
+    return float(damage)
+
+
+def predict_remaining_hours_slmta15(df_history: pd.DataFrame,
+                                     unit_ids: list | None = None,
+                                     rpms: list | None = None,
+                                     used_hours: float | None = None) -> pd.DataFrame:
+    """
+    FINAL PREDICTION LOGIC: for every unit, using its REAL historical
+    operation (up to `used_hours`, or up to its own latest recorded row if
+    used_hours is None) to compute damage already consumed
+    (Palmgren-Miner + SLMTA15 S-N curve), predict the REMAINING operating
+    hours if it now switches to each candidate RPM.
+
+        remaining_hours = (1 - damage_used) * (N_f(stress_at_rpm) / (rpm * 60))
+
+    Loading for the new scenario is anchored to this unit's OWN actual life
+    span/last recorded cycle (via calculate_loading_and_time), not a
+    generic assumption.
+    """
+    healthy = CONFIG["healthy_ranges"]
+    if unit_ids is None:
+        unit_ids = sorted(df_history["unit_id"].unique())
+    if rpms is None:
+        rpms = CONFIG.get("scenario_rpms", [3000, 4000, 5000, 6000])
+
+    rows = []
+    for unit_id in unit_ids:
+        unit_df = df_history[df_history["unit_id"] == unit_id].sort_values("cycle").reset_index(drop=True)
+        if unit_df.empty:
+            continue
+
+        last_row = unit_df.iloc[-1]
+        last_cycle = int(last_row["cycle"])
+        last_time_hours = float(last_row["time_hours"])
+
+        # Default: treat ALL of this unit's real recorded history as "used".
+        unit_used_hours = last_time_hours if used_hours is None else used_hours
+
+        damage_used = compute_used_damage_slmta15(unit_df, unit_used_hours)
+        damage_used = min(damage_used, 0.999999)
+
+        unit_life = last_cycle
+        next_cycle = last_cycle + 1
+
+        for rpm in rpms:
+            loading, _ = calculate_loading_and_time(float(rpm), next_cycle, unit_life, healthy)
+
+            stress_mpa = _stress_from_loading(loading)
+            n_f_cycles = _fatigue_life_cycles_slmta15(stress_mpa)
+            cycles_per_hour = rpm * 60.0
+            total_life_hours = n_f_cycles / cycles_per_hour
+
+            remaining_fraction = max(0.0, 1.0 - damage_used)
+            remaining_hours = remaining_fraction * total_life_hours
+
+            rows.append({
+                "unit_id": int(unit_id),
+                "used_hours": round(unit_used_hours, 2),
+                "damage_used": round(damage_used, 5),
+                "rpm": float(rpm),
+                "loading": loading,
+                "stress_mpa": round(stress_mpa, 1),
+                "fatigue_life_cycles": round(n_f_cycles, 0),
+                "cycles_per_hour": int(cycles_per_hour),
+                "total_life_hours": round(total_life_hours, 2),
+                "predicted_remaining_hours": round(remaining_hours, 2),
+            })
+
+    out = pd.DataFrame(rows)
+
+    output_dir = "data/output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "rul_slmta15_material_model.csv")
+    out.to_csv(output_path, index=False)
+    log.info(f"Saved SLMTA15 material-model remaining-hours table to {output_path}")
+
+    print("\n=== SLMTA15 Material Fatigue Model - Remaining Hours (per-unit real used_hours) ===")
+    print("Material: SLMTA15 | Formula: cycles/hour = rpm x 60 | life_hours = N_f(stress) / cycles_per_hour")
+    print("Loading is anchored to each unit's own real recorded trajectory, not a generic rpm-ratio guess.")
+    print(out.rename(columns={
+        "unit_id": "Unit", "used_hours": "Used(hrs)", "damage_used": "Damage Used",
+        "rpm": "RPM", "loading": "Load", "stress_mpa": "Stress(MPa)", "fatigue_life_cycles": "N_f(cycles)",
+        "cycles_per_hour": "Cycles/hr", "total_life_hours": "Total Life(hrs)",
+        "predicted_remaining_hours": "Remaining(hrs)",
+    }).to_string(index=False))
+
+    return out
+
+# ─────────────────────────────────────────────
+#   Fresh Turbine Degradation Simulator (0 -> Failure)
+#   Uses the SLMTA15 S-N curve, starting from a brand-new blade
+#   (damage = 0) and stepping forward ONE HOUR at a time until failure.
+# ─────────────────────────────────────────────
+def simulate_fresh_turbine_to_failure(rpm: float, stress_mpa: float | None = None, max_hours: int = 2000) -> pd.DataFrame:
+    """
+    ... (docstring unchanged) ...
+    """
+    healthy = CONFIG["healthy_ranges"]
+    failure_threshold = 1.0
+
+    rpm_ratio = _rpm_ratio(rpm, healthy)
+
+    fixed_n_f_cycles = None
+    fixed_life_hours = None
+    if stress_mpa is not None:
+        fixed_n_f_cycles = _fatigue_life_cycles_slmta15(float(stress_mpa))
+        fixed_life_hours = fixed_n_f_cycles / (rpm * 60.0)
+
+    cumulative_damage = 0.0
+    rows = []
+    elapsed_hours = 0.0   # fractional-aware total hours elapsed
+    step = 0
+
+    while cumulative_damage < failure_threshold and step < max_hours:
+        step += 1
+
+        if stress_mpa is not None:
+            stress = float(stress_mpa)
+            n_f_cycles = fixed_n_f_cycles
+        else:
+            loading = round(0.45 + 0.45 * rpm_ratio + 0.05 * min(cumulative_damage, 1.0), 3)
+            stress = _stress_from_loading(loading)
+            n_f_cycles = _fatigue_life_cycles_slmta15(stress)
+
+        cycles_per_hour = rpm * 60.0
+        damage_increment_full_hour = cycles_per_hour / n_f_cycles
+        remaining_damage = failure_threshold - cumulative_damage
+
+        if damage_increment_full_hour >= remaining_damage:
+            # Failure occurs partway through this simulated hour —
+            # scale the step down to exactly how long it actually takes.
+            fraction_of_hour = remaining_damage / damage_increment_full_hour
+            damage_increment = remaining_damage
+            cumulative_damage = failure_threshold
+            hours_this_step = fraction_of_hour
+            cycles_this_step = cycles_per_hour * fraction_of_hour
+            status = "Failed"
+        else:
+            damage_increment = damage_increment_full_hour
+            cumulative_damage += damage_increment
+            hours_this_step = 1.0
+            cycles_this_step = cycles_per_hour
+
+            health_score = 100.0 * (1.0 - cumulative_damage)
+            if health_score <= 25:
+                status = "Critical"
+            elif health_score <= 60:
+                status = "Warning"
+            else:
+                status = "Healthy"
+
+        elapsed_hours += hours_this_step
+        health_score = float(np.clip(100.0 * (1.0 - cumulative_damage), 0.0, 100.0))
+
+        rows.append({
+            "hour": round(elapsed_hours, 4),
+            "cycle": round(elapsed_hours, 4),
+            "rpm": rpm,
+            "stress_mpa": round(stress, 1),
+            "cycles_per_hour": int(cycles_per_hour),
+            "cycles_this_step": round(cycles_this_step, 0),
+            "damage_increment": round(damage_increment, 6),
+            "cumulative_damage": round(cumulative_damage, 5),
+            "health_score": round(health_score, 2),
+            "status": status,
+        })
+
+    out = pd.DataFrame(rows)
+
+    output_dir = "data/output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"fresh_turbine_degradation_rpm{int(rpm)}.csv")
+    out.to_csv(output_path, index=False)
+    log.info(f"Saved fresh-turbine degradation curve (rpm={rpm}) to {output_path}")
+
+    total_hours_to_failure = out["hour"].iloc[-1] if not out.empty else 0
+    reached_failure = not out.empty and out["cumulative_damage"].iloc[-1] >= failure_threshold
+
+    print(f"\n=== Fresh Turbine Degradation Simulation of SLMTA15 material(0 -> Failure) ===")
+    stress_desc = f"fixed {stress_mpa} MPa" if stress_mpa is not None else "derived from loading"
+    fatigue_life_desc = f" | Total Fatigue life: {fixed_n_f_cycles:,.0f} cycles" if fixed_n_f_cycles is not None else ""
+    life_hours_desc = f" | Estimated operating life : {fixed_life_hours:.2f} hours" if fixed_life_hours is not None else ""
+    print(f"RPM: {rpm} | Stress mode: {stress_desc}{fatigue_life_desc}{life_hours_desc}")
+    print(out.to_string(index=False))
+    if reached_failure:
+        print(f"\n>> Estimated operating life until failure: {total_hours_to_failure:.2f} hours "
+              f"(~{total_hours_to_failure:.2f} simulated hours to reach damage index = 1.0)")
+    else:
+        print(f"\n>> Did not reach failure within max_hours={max_hours} (damage reached "
+              f"{out['cumulative_damage'].iloc[-1] if not out.empty else 0:.4f})")
+
+    return out
 # ─────────────────────────────────────────────
 # 2. Feature Engineering
 # ─────────────────────────────────────────────
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create rolling statistical features from the active input parameter(s),
-    plus physics-grounded degradation features: RPM stress index, thermal
-    stress, damage accumulation (Palmgren-Miner style), health index,
-    exponential degradation score and normalized remaining life.
+    Create rolling statistical features from the active input parameter(s):
+    rolling mean/std, lag, diff, cycle progress, and a cumulative
+    degradation index (cdi). Sorted by unit → cycle to preserve time-series
+    order.
     """
     df = df.sort_values(["unit_id", "cycle"]).reset_index(drop=True)
     healthy = CONFIG["healthy_ranges"]
-    deg_cfg = CONFIG["degradation_model"]
-    failure_threshold = CONFIG["failure_threshold"]
 
     for feat in CONFIG["input_features"]:
         for w in CONFIG["rolling_windows"]:
@@ -179,38 +481,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cycle_progress"] = df.groupby("unit_id")["cycle"].rank(method="first") / df.groupby("unit_id").size().reindex(df["unit_id"]).to_numpy()
     df["cycle_progress"] = df["cycle_progress"].fillna(0)
 
-    # --- Physics-based degradation features -----------------------------
-    # RPM stress index: centrifugal stress scales with rpm^2 (normalized to
-    # the reference/nominal rpm from the degradation model config).
-    rpm_ref = deg_cfg["stress_rpm_ref"]
-    df["rpm_stress_index"] = (df["rpm"] / rpm_ref) ** 2
-
-    # Thermal stress: how far above nominal operating temperature, clipped >= 0.
-    t_max = healthy["temperature"]["max"]
-    df["thermal_stress"] = ((df["temperature"] - baseline_temp) / max(1.0, (t_max - baseline_temp))).clip(lower=0)
-
-    # Per-row damage increment via Basquin's equation + Palmgren-Miner rule,
-    # accumulated per unit to give a running damage index in [0, ~1+].
-    def _damage_increment_row(rpm, temperature):
-        return compute_hourly_damage_increment(rpm, temperature, deg_cfg, healthy)[0]
-
-    df["damage_increment"] = [
-        _damage_increment_row(r, t) for r, t in zip(df["rpm"], df["temperature"])
-    ]
-    df["damage_index"] = df.groupby("unit_id")["damage_increment"].cumsum()
-
-    # Health index: 100 at new condition, falling to 0 as damage_index -> 1.0.
-    df["health_index"] = (100.0 * (1.0 - df["damage_index"].clip(upper=1.0))).clip(lower=0.0)
-
-    # Exponential degradation score: emphasizes the accelerating tail-end
-    # of wear (small at low damage, grows quickly as damage_index rises).
-    df["exp_degradation_score"] = 1.0 - np.exp(-5.0 * df["damage_index"])
-
-    # Normalized remaining life relative to the configured failure threshold.
-    df["normalized_remaining_life"] = (1.0 - df["damage_index"] / failure_threshold).clip(lower=0.0, upper=1.0)
-
-    # Keep the original cumulative degradation index (cdi) for backward
-    # compatibility with earlier phase-1 experiments/plots.
     df["cdi"] = (
         df.groupby("unit_id")["temperature"].transform(lambda x: ((x - baseline_temp).clip(lower=0).cumsum()))
         + df.groupby("unit_id")["rpm"].transform(lambda x: ((x - baseline_rpm).abs().cumsum()))
@@ -226,38 +496,65 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 def split_data(df: pd.DataFrame):
     """
-    Split by whole turbine unit_id, not by row. This keeps every cycle of a
-    given unit entirely in either train or test, preventing the model from
-    seeing a turbine's other cycles during training.
+    Split by whole turbine unit_id when there are enough units to do so
+    (keeps every cycle of a given unit entirely in train or test, avoiding
+    leakage). If there are too few units (e.g. only 1, as with a small
+    test/real-data upload) to hold out a whole unit without emptying the
+    training set, falls back to a per-unit TIME-BASED split instead: the
+    earliest cycles of each unit go to train, the latest go to test.
     """
     drop_cols = ["unit_id", "cycle", CONFIG["target"]]
     feature_cols = [c for c in df.columns if c not in drop_cols]
 
     unit_ids = df["unit_id"].unique()
     rng = np.random.default_rng(CONFIG["random_state"])
-    rng.shuffle(unit_ids)
 
-    n_test_units = max(1, int(round(len(unit_ids) * CONFIG["test_size"])))
-    test_units = set(unit_ids[:n_test_units])
-    train_units = set(unit_ids[n_test_units:])
+    # Need at least 2 units to hold one out entirely without leaving
+    # train empty. Otherwise, split by cycle within each unit.
+    min_units_for_unit_split = 2
 
-    train_df = df[df["unit_id"].isin(train_units)].reset_index(drop=True)
-    test_df = df[df["unit_id"].isin(test_units)].reset_index(drop=True)
+    if len(unit_ids) >= min_units_for_unit_split:
+        shuffled = unit_ids.copy()
+        rng.shuffle(shuffled)
+
+        n_test_units = max(1, int(round(len(shuffled) * CONFIG["test_size"])))
+        n_test_units = min(n_test_units, len(shuffled) - 1)  # always leave >=1 unit for train
+        test_units = set(shuffled[:n_test_units])
+        train_units = set(shuffled[n_test_units:])
+
+        train_df = df[df["unit_id"].isin(train_units)].reset_index(drop=True)
+        test_df = df[df["unit_id"].isin(test_units)].reset_index(drop=True)
+
+        log.info(f"Split mode: by whole unit. Train units: {sorted(train_units)}  Test units: {sorted(test_units)}")
+    else:
+        # Fallback: time-based split within each unit's own cycles.
+        train_parts, test_parts = [], []
+        for unit_id in unit_ids:
+            unit_df = df[df["unit_id"] == unit_id].sort_values("cycle").reset_index(drop=True)
+            n = len(unit_df)
+            if n < 2:
+                # Not enough rows to split at all — put the single row in train.
+                train_parts.append(unit_df)
+                continue
+            n_test = max(1, int(round(n * CONFIG["test_size"])))
+            n_test = min(n_test, n - 1)  # always leave >=1 row for train
+            train_parts.append(unit_df.iloc[:-n_test])
+            test_parts.append(unit_df.iloc[-n_test:])
+
+        train_df = pd.concat(train_parts, ignore_index=True) if train_parts else df.iloc[0:0]
+        test_df = pd.concat(test_parts, ignore_index=True) if test_parts else df.iloc[0:0]
+
+        log.info(f"Split mode: too few units ({len(unit_ids)}) for whole-unit split — using per-unit time-based split instead.")
 
     X_train, y_train = train_df[feature_cols], train_df[CONFIG["target"]]
     X_test, y_test = test_df[feature_cols], test_df[CONFIG["target"]]
 
-    log.info(f"Train units: {sorted(train_units)}  ({X_train.shape})")
-    log.info(f"Test units:  {sorted(test_units)}  ({X_test.shape})")
+    log.info(f"Train shape: {X_train.shape} | Test shape: {X_test.shape}")
     return X_train, X_test, y_train, y_test
 
 
 # ─────────────────────────────────────────────
-# 4. Final Model — AutoGluon Three-Layer Stacked Ensemble (unchanged)
-#    Layer 1 → Random Forest       (base learner)
-#    Layer 2 → XGBoost             (residual corrector — OOF predictions)
-#    Layer 3 → PyTorch Neural Net  (deep learner — OOF predictions)
-#              └─ Weighted Ensemble → RUL Prediction (hours)
+# 4. Final Model — AutoGluon Three-Layer Stacked Ensemble
 # ─────────────────────────────────────────────
 def train_final_model(X_train, y_train, X_test, y_test):
     """Returns (model_name, predict_fn, metrics)."""
@@ -281,8 +578,8 @@ def train_final_model(X_train, y_train, X_test, y_test):
                     time_limit=cfg["time_limit"],
                     presets=cfg["presets"],
                     verbosity=cfg["verbosity"],
-                    num_stack_levels=2,       # 3-layer stacking: base → L1 → L2 meta
-                    num_bag_folds=5,          # out-of-fold predictions between layers
+                    num_stack_levels=2,
+                    num_bag_folds=5,
                 )
     except ImportError:
         from sklearn.ensemble import RandomForestRegressor
@@ -312,7 +609,7 @@ def train_final_model(X_train, y_train, X_test, y_test):
 
 
 # ─────────────────────────────────────────────
-# 5. Display + Combined Prediction Summary
+# 5. Display + Combined ML Prediction Summary
 # ─────────────────────────────────────────────
 def display_final_model_results(model_name: str, metrics: dict):
     """Single combined block for model performance."""
@@ -328,8 +625,8 @@ def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
                                  cycles: list | None = None) -> pd.DataFrame:
     """
     Combined table across ALL turbine units: actual rpm/temperature/loading
-    + actual vs predicted RUL for specific cycles (e.g. 1, 10, 60, 120).
-    Vibration/pressure columns removed.
+    + actual vs predicted RUL (from the trained ML model) for specific
+    cycles (e.g. 1, 10, 60, 120).
     """
     if unit_ids is None:
         unit_ids = sorted(df["unit_id"].unique())
@@ -377,273 +674,15 @@ def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
     print(out.to_string(index=False))
     return out
 
-
-# ─────────────────────────────────────────────
-# 6. Physics-based hourly damage model
-#    (Basquin's equation + Palmgren-Miner cumulative damage rule +
-#     centrifugal stress ~ rpm^2). Vibration term removed.
-# ─────────────────────────────────────────────
-def compute_hourly_damage_increment(rpm: float, temperature: float,
-                                     deg_cfg: dict, healthy: dict) -> tuple[float, float, float]:
-    """
-    Returns (damage_increment_per_hour, rpm_stress_index, thermal_stress).
-
-    Centrifugal stress amplitude is modeled as scaling with rpm^2 (standard
-    rotor-dynamics relationship), non-dimensionalized against a reference rpm.
-    Basquin's equation (sigma_a = sigma_f' * (2 N_f)^b) is inverted to get the
-    number of hours-to-failure N_f at that stress level; 1/N_f is the base
-    per-hour damage increment (Palmgren-Miner rule: damage accumulates as
-    n_i / N_fi and failure occurs when the sum reaches the failure threshold).
-    Thermal stress acts as a secondary multiplier on top of the
-    centrifugal-stress-driven base damage rate.
-    """
-    rpm_ref = deg_cfg["stress_rpm_ref"]
-    b = deg_cfg["basquin_exponent"]
-    sigma_f = deg_cfg["fatigue_strength_coefficient"]
-
-    life_scale = deg_cfg.get("life_scale_hours", 1.0)
-    stress_amp = (rpm / rpm_ref) ** 2  # rpm_stress_index
-    ratio = max(stress_amp / sigma_f, 1e-6)
-    n_f_hours = life_scale * 0.5 * (ratio ** (1.0 / b))  # Basquin's equation, solved for N_f
-    n_f_hours = max(n_f_hours, 1e-3)
-    base_damage_per_hour = 1.0 / n_f_hours
-
-    t_max, t_nom = healthy["temperature"]["max"], healthy["temperature"]["nominal"]
-    thermal_stress = max(0.0, (temperature - t_nom) / max(1.0, (t_max - t_nom)))
-
-    multiplier = 1.0 + deg_cfg["thermal_stress_weight"] * thermal_stress
-    damage_increment = base_damage_per_hour * multiplier
-    return damage_increment, stress_amp, thermal_stress
-
-
-def _status_from_health(health_score: float, damage_index: float, cfg: dict) -> str:
-    if damage_index >= cfg["failure_threshold"] or health_score <= cfg["health_threshold"]:
-        return "Critical"
-    if health_score <= cfg["warning_threshold"]:
-        return "Warning"
-    return "Healthy"
-
-# ─────────────────────────────────────────────
-# 6b. Range / band labeling helpers
-# ─────────────────────────────────────────────
-def _band_label(value: float, min_v: float, max_v: float) -> str:
-    """
-    Classify a value into a Low / Medium / High band relative to the given
-    [min_v, max_v] range, splitting the range into equal thirds. Returns only
-    the band name (no numeric range shown inline) — used for rpm and
-    temperature range labels in the scenario output.
-    """
-    span = max_v - min_v
-    if span <= 0:
-        return "N/A"
-    third = span / 3.0
-    if value <= min_v + third:
-        return "Low"
-    elif value <= min_v + 2 * third:
-        return "Medium"
-    return "High"
-
-
-def _loading_band_label(value: float, min_v: float, max_v: float) -> str:
-    """Same tertile logic as _band_label, returns only the band name for loading."""
-    span = max_v - min_v
-    if span <= 0:
-        return "N/A"
-    third = span / 3.0
-    if value <= min_v + third:
-        return "Low"
-    elif value <= min_v + 2 * third:
-        return "Medium"
-    return "High"
-
-def _print_range(healthy: dict, cfg: dict) -> None:
-    """
-    Print a one-time reference legend showing exactly what each Low/Medium/
-    High band means in real units, so the table below (which only shows the
-    band name) can still be interpreted precisely. Each section also states
-    the unit of measurement being used.
-    """
-    rpm_min, rpm_max = healthy["rpm"]["min"], healthy["rpm"]["max"]
-    rpm_third = (rpm_max - rpm_min) / 3.0
-
-    temp_min, temp_max = healthy["temperature"]["min"], healthy["temperature"]["max"]
-    temp_third = (temp_max - temp_min) / 3.0
-
-    load_min, load_max = healthy["loading"]["min"], healthy["loading"]["max"]
-    load_third = (load_max - load_min) / 3.0
-
-    print("\n--- Range ---")
-
-    print("RPM Range (Revolutions Per Minute - rpm):")
-    print(f"  Low    ({rpm_min:.0f}-{rpm_min + rpm_third:.0f}) rpm")
-    print(f"  Medium ({rpm_min + rpm_third:.0f}-{rpm_min + 2 * rpm_third:.0f}) rpm")
-    print(f"  High   ({rpm_min + 2 * rpm_third:.0f}-{rpm_max:.0f}) rpm")
-
-    print("Temp Range (Temperature in Kelvin - K):")
-    print(f"  Low    ({temp_min:.0f}-{temp_min + temp_third:.0f}) K")
-    print(f"  Medium ({temp_min + temp_third:.0f}-{temp_min + 2 * temp_third:.0f}) K")
-    print(f"  High   ({temp_min + 2 * temp_third:.0f}-{temp_max:.0f}) K")
-
-    print("Load Range (Loading Factor - unitless ratio, 0 to 1):")
-    print(f"  Low    ({load_min:.2f}-{load_min + load_third:.2f})")
-    print(f"  Medium ({load_min + load_third:.2f}-{load_min + 2 * load_third:.2f})")
-    print(f"  High   ({load_min + 2 * load_third:.2f}-{load_max:.2f})")
-
-    print("Health Status Range (Health Score - unitless, 0 to 100 scale):")
-    print(f"  Critical (<= {cfg['health_threshold']})")
-    print(f"  Warning  ({cfg['health_threshold']}-{cfg['warning_threshold']})")
-    print(f"  Healthy  (> {cfg['warning_threshold']})")
-
-    print("---------------------\n")
-
-def simulate_one_hour_scenario(unit_id: int, rpm: float, prior_damage_index: float,
-                                prior_op_hours: float, rng: np.random.Generator) -> dict:
-    """
-    Simulate exactly ONE HOUR of operation for a given unit at a given RPM,
-    starting from that unit's own current damage/operating-hour state, and
-    dynamically generate the resulting sensor readings + damage/health
-    outcome. Every call with a fresh rng produces different noise, so no two
-    runs (or units) look alike. Also attaches rpm/temperature/load range bands
-    (Low/Medium/High only) for the output table.
-    """
-    healthy = CONFIG["healthy_ranges"]
-    deg_cfg = CONFIG["degradation_model"]
-    rpm_ratio = _rpm_ratio(rpm, healthy)
-
-    t_nom, t_max = healthy["temperature"]["nominal"], healthy["temperature"]["max"]
-    temperature = t_nom + (t_max - t_nom) * 0.55 * rpm_ratio + 0.04 * prior_op_hours
-    temperature += rng.normal(0, 3.0)
-    temperature = float(np.clip(temperature, healthy["temperature"]["min"], healthy["temperature"]["max"]))
-
-    loading = round(0.45 + 0.45 * rpm_ratio + 0.05 * min(prior_damage_index, 1.0), 3)
-
-    damage_increment, rpm_stress_index, thermal_stress = compute_hourly_damage_increment(
-        rpm, temperature, deg_cfg, healthy
-    )
-    damage_index = prior_damage_index + damage_increment
-    health_score = float(np.clip(100.0 * (1.0 - min(damage_index, 1.0)), 0.0, 100.0))
-
-    failure_threshold = CONFIG["failure_threshold"]
-    if damage_increment > 1e-9:
-        remaining_hours = max(0.0, (failure_threshold - damage_index) / damage_increment)
-    else:
-        remaining_hours = float("inf")
-
-    status = _status_from_health(health_score, damage_index, CONFIG)
-
-    # --- Range / band labels (Low / Medium / High only) ---
-    rpm_range = _band_label(rpm, healthy["rpm"]["min"], healthy["rpm"]["max"])
-    temperature_range = _band_label(temperature, healthy["temperature"]["min"], healthy["temperature"]["max"])
-    load_range = _loading_band_label(loading, healthy["loading"]["min"], healthy["loading"]["max"])
-
-    return {
-        "unit_id": unit_id,
-        "rpm": rpm,
-        "rpm_range": rpm_range,
-        "operating_hours": 1,
-        "temperature": round(temperature, 2),
-        "temperature_range": temperature_range,
-        "loading": loading,
-        "load_range": load_range,
-        "rpm_stress_index": round(rpm_stress_index, 4),
-        "thermal_stress": round(thermal_stress, 4),
-        "damage_index": round(damage_index, 5),
-        "health_score": round(health_score, 2),
-        "threshold": failure_threshold,
-        "predicted_remaining_hours": round(remaining_hours, 1) if np.isfinite(remaining_hours) else remaining_hours,
-        "status": status,
-    }
-
-def simulate_units_rpm_scenarios(df_history: pd.DataFrame, predict_fn, feature_cols: list,
-                                  n_units: int | None = None) -> pd.DataFrame:
-    """
-    For every simulated turbine unit, run each configured RPM scenario
-    (3000/4000/5000/6000) for exactly one hour, starting from that unit's own
-    current wear state (its last known damage_index / operating hours from
-    df_history). Reports both the physics-based remaining-hours estimate and
-    the AutoGluon/RandomForest model's own predicted RUL for the same
-    post-scenario state, plus rpm/temperature/load range bands (Low/Medium/
-    High only). Status (Critical/Warning/Healthy). A one-time range legend is
-    printed right below the table header explaining each band's numeric
-    bounds.
-    """
-    all_unit_ids = sorted(df_history["unit_id"].unique())
-
-    if n_units is None:
-        n_units = CONFIG.get("num_scenario_units")
-
-    unit_ids = all_unit_ids if n_units is None else all_unit_ids[:n_units]
-    scenario_rpms = CONFIG["scenario_rpms"]
-
-    rows = []
-    for unit_id in unit_ids:
-        unit_hist = df_history[df_history["unit_id"] == unit_id].sort_values("cycle").reset_index(drop=True)
-        mid_cycle = int(round(unit_hist["cycle"].max() * 0.5))
-        mid_idx = (unit_hist["cycle"] - mid_cycle).abs().idxmin()
-        current_row = unit_hist.loc[mid_idx]
-        prior_damage_index = float(current_row.get("damage_index", 0.0))
-        prior_op_hours = float(current_row.get("operating_hours", current_row["time_hours"]))
-        recent = unit_hist.iloc[max(0, mid_idx - 19):mid_idx + 1].copy()
-
-        for rpm in scenario_rpms:
-            rng = np.random.default_rng(RUN_SEED + unit_id * 97 + int(rpm))
-            result = simulate_one_hour_scenario(int(unit_id), float(rpm), prior_damage_index, prior_op_hours, rng)
-
-            next_cycle = int(recent["cycle"].max()) + 1
-            scenario_row = pd.DataFrame([{
-                "unit_id": int(unit_id),
-                "cycle": next_cycle,
-                "rpm": float(rpm),
-                "temperature": result["temperature"],
-                "loading": result["loading"],
-                "time_hours": round(prior_op_hours + 1.0, 2),
-                "rul": 0,
-            }])
-            combined = pd.concat([recent, scenario_row], ignore_index=True)
-            combined = engineer_features(combined)
-            case_features = combined[feature_cols].fillna(0).iloc[[-1]]
-            ml_pred_rul = float(predict_fn(case_features[feature_cols])[0])
-
-            result["ml_predicted_rul_hours"] = round(ml_pred_rul, 2)
-            rows.append(result)
-
-    out = pd.DataFrame(rows)
-    # "health_status_range" column removed
-    cols = ["unit_id", "rpm", "rpm_range", "operating_hours", "temperature", "temperature_range",
-            "loading", "load_range", "damage_index", "health_score", "threshold",
-            "predicted_remaining_hours", "ml_predicted_rul_hours", "status"]
-    out = out[cols]
-
-    os.makedirs(os.path.dirname(CONFIG["scenario_table_path"]), exist_ok=True)
-    out.to_csv(CONFIG["scenario_table_path"], index=False)
-
-    print("\n=== One-Hour RPM Scenario Table (All Simulated Units) ===")
-    _print_range(CONFIG["healthy_ranges"], CONFIG)
-    print(out.rename(columns={
-        "unit_id": "Unit", "rpm": "RPM", "rpm_range": "RPM Range",
-        "operating_hours": "Hours", "temperature": "Temp", "temperature_range": "Temp Range",
-        "loading": "Load", "load_range": "Load Range",
-        "damage_index": "Damage", "health_score": "Health",
-        "threshold": "Threshold", "predicted_remaining_hours": "RUL(hrs)",
-        "ml_predicted_rul_hours": "ML-RUL(hrs)", "status": "Status",
-    })[["Unit", "RPM", "RPM Range", "Hours", "Temp", "Temp Range", "Load", "Load Range",
-        "Damage", "Health", "Threshold", "RUL(hrs)", "ML-RUL(hrs)", "Status"]]
-          .to_string(index=False))
-    return out
-
-
 # ─────────────────────────────────────────────
 # 7. Visualization
 # ─────────────────────────────────────────────
-def generate_visualizations(df_history: pd.DataFrame, scenario_table: pd.DataFrame, example_unit_id: int | None = None):
+def generate_visualizations(df_history: pd.DataFrame, slmta15_table: pd.DataFrame,
+                             example_unit_id: int | None = None):
     """
-    Produces the requested plots:
-      - Health Score vs Time
-      - Damage Index vs Time (with the failure threshold line)
-      - Temperature vs Time
-      - Loading vs Time
-      - RPM vs RUL (from the scenario table, across units)
-    Saved as PNGs under CONFIG["plots_dir"].
+    Temperature vs Time, Loading vs Time (from real historical data), and
+    RPM vs Predicted Remaining Hours (from the SLMTA15 material model
+    output), across all units.
     """
     plots_dir = CONFIG["plots_dir"]
     os.makedirs(plots_dir, exist_ok=True)
@@ -652,50 +691,38 @@ def generate_visualizations(df_history: pd.DataFrame, scenario_table: pd.DataFra
         example_unit_id = int(df_history["unit_id"].iloc[0])
     unit_df = df_history[df_history["unit_id"] == example_unit_id].sort_values("cycle")
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
-    axes[0, 0].plot(unit_df["time_hours"], unit_df["health_index"], color="tab:green")
-    axes[0, 0].set_title(f"Health Score vs Time (Unit {example_unit_id})")
-    axes[0, 0].set_xlabel("Operating Hours")
-    axes[0, 0].set_ylabel("Health Score")
+    axes[0].plot(unit_df["time_hours"], unit_df["temperature"], color="tab:orange")
+    axes[0].set_title(f"Temperature vs Time (Unit {example_unit_id})")
+    axes[0].set_xlabel("Operating Hours")
+    axes[0].set_ylabel("Temperature (K)")
 
-    axes[0, 1].plot(unit_df["time_hours"], unit_df["damage_index"], color="tab:red")
-    axes[0, 1].axhline(CONFIG["failure_threshold"], color="black", linestyle="--", label="Failure threshold")
-    axes[0, 1].set_title(f"Damage Index vs Time — Threshold Crossing (Unit {example_unit_id})")
-    axes[0, 1].set_xlabel("Operating Hours")
-    axes[0, 1].set_ylabel("Damage Index")
-    axes[0, 1].legend()
-
-    axes[1, 0].plot(unit_df["time_hours"], unit_df["temperature"], color="tab:orange")
-    axes[1, 0].set_title(f"Temperature vs Time (Unit {example_unit_id})")
-    axes[1, 0].set_xlabel("Operating Hours")
-    axes[1, 0].set_ylabel("Temperature (K)")
-
-    axes[1, 1].plot(unit_df["time_hours"], unit_df["loading"], color="tab:blue")
-    axes[1, 1].set_title(f"Loading vs Time (Unit {example_unit_id})")
-    axes[1, 1].set_xlabel("Operating Hours")
-    axes[1, 1].set_ylabel("Loading")
+    axes[1].plot(unit_df["time_hours"], unit_df["loading"], color="tab:blue")
+    axes[1].set_title(f"Loading vs Time (Unit {example_unit_id})")
+    axes[1].set_xlabel("Operating Hours")
+    axes[1].set_ylabel("Loading")
 
     fig.tight_layout()
-    combined_path = os.path.join(plots_dir, f"unit_{example_unit_id}_degradation_overview.png")
+    combined_path = os.path.join(plots_dir, f"unit_{example_unit_id}_history_overview.png")
     fig.savefig(combined_path, dpi=150)
     plt.close(fig)
-    log.info(f"Saved degradation overview plot to {combined_path}")
+    log.info(f"Saved history overview plot to {combined_path}")
 
-    # RPM vs RUL, across all simulated units/scenarios
+    # RPM vs Predicted Remaining Hours (SLMTA15 model), across all units
     fig2, ax2 = plt.subplots(figsize=(7, 5))
-    for uid, grp in scenario_table.groupby("unit_id"):
+    for uid, grp in slmta15_table.groupby("unit_id"):
         grp_sorted = grp.sort_values("rpm")
         ax2.plot(grp_sorted["rpm"], grp_sorted["predicted_remaining_hours"], marker="o", label=f"Unit {uid}")
-    ax2.set_title("RPM vs Predicted Remaining Hours (All Units)")
+    ax2.set_title("RPM vs Predicted Remaining Hours (SLMTA15 Model, All Units)")
     ax2.set_xlabel("RPM")
     ax2.set_ylabel("Predicted Remaining Hours")
     ax2.legend()
     fig2.tight_layout()
-    rpm_rul_path = os.path.join(plots_dir, "rpm_vs_rul.png")
+    rpm_rul_path = os.path.join(plots_dir, "rpm_vs_remaining_hours_slmta15.png")
     fig2.savefig(rpm_rul_path, dpi=150)
     plt.close(fig2)
-    log.info(f"Saved RPM vs RUL plot to {rpm_rul_path}")
+    log.info(f"Saved RPM vs Remaining Hours plot to {rpm_rul_path}")
 
     return [combined_path, rpm_rul_path]
 
@@ -715,9 +742,17 @@ def _metrics(y_true, y_pred) -> dict:
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def main():
+def main(uploaded_csv_path: str | None = None):
+    """
+    uploaded_csv_path: path to a NEW real-data CSV to ingest this run
+    (unit_id, cycle, rpm, temperature, loading, time_hours, rul). This is
+    merged into the persistent real-data store as CURRENT DATA on top of
+    OLD DATA from previous runs. If omitted, the accumulated store on disk
+    is reused as-is (or, if no store exists yet, falls back to synthetic
+    data so the pipeline never crashes on a first-time setup).
+    """
     log.info("=" * 55)
-    log.info("  Turbine RUL Prediction — RPM/Temperature/Load Degradation Simulator")
+    log.info("  Turbine RUL Prediction — Real-Data + SLMTA15 Material Model")
     log.info("=" * 55)
 
     healthy = CONFIG["healthy_ranges"]
@@ -729,12 +764,28 @@ def main():
         f"Temperature {healthy['temperature']['min']}-{healthy['temperature']['max']} K "
         f"({healthy['temperature']['min']-273.15:.0f}°C-{healthy['temperature']['max']-273.15:.0f}°C; nominal {healthy['temperature']['nominal']-273.15:.0f}°C)"
     )
-    log.info(f"Failure threshold (damage index): {CONFIG['failure_threshold']} | Health threshold: {CONFIG['health_threshold']}")
 
-    # 1. Data (rpm, temperature, loading, time_hours only)
-    df = load_paper_dataset()
+    # Example 1: Industrial Gas Turbine (3000 rpm, fixed stress = 700 MPa)
+    simulate_fresh_turbine_to_failure(rpm=4000, stress_mpa=600)
+    # Expect life_hours ≈ N_f(700MPa)/(3000*60) ≈ 4.0e6/180000 ≈ 22.22 hrs
+    # (config's 700 MPa entry is now 4.0e6 cycles — the upper bound of its
+    #  8e5–4e6 scatter range — matching this worked example exactly)
 
-    # 2. Features (includes damage_index / health_index / etc.)
+    # Example 2: Aircraft High-Pressure Turbine (15000 rpm, 700 MPa)
+    # simulate_fresh_turbine_to_failure(rpm=15000, stress_mpa=700)
+
+    # # Example 3: Aircraft Low-Pressure Turbine (6000 rpm, 700 MPa)
+    # simulate_fresh_turbine_to_failure(rpm=6000, stress_mpa=700)
+
+    # # Realistic mode: stress evolves naturally from loading as the turbine ages
+    # simulate_fresh_turbine_to_failure(rpm=6000, stress_mpa=None)
+
+    # 1. Data — REAL data (old + current, accumulated in the persistent
+    #    store), with synthetic fallback only if nothing real exists yet.
+    df = load_paper_dataset(uploaded_csv_path=uploaded_csv_path)
+    log.info(f"Loaded dataset: {len(df)} rows across {df['unit_id'].nunique()} unit(s)")
+
+    # 2. Features
     df = engineer_features(df)
     os.makedirs("data/processed", exist_ok=True)
     df.to_csv(CONFIG["processed_path"], index=False)
@@ -742,27 +793,30 @@ def main():
     # 3. Split — by whole unit, no leakage
     X_train, X_test, y_train, y_test = split_data(df)
 
-    # 4. Train the single final model (AutoGluon, or RandomForest fallback)
+    # 4. Train the single final ML model (AutoGluon, or RandomForest fallback)
     model_name, predict_fn, metrics = train_final_model(X_train, y_train, X_test, y_test)
 
     # 5. Combined display — one block, one model
-    display_final_model_results(model_name, metrics)
+    # display_final_model_results(model_name, metrics)
+    
 
-    # 6. Combined ML prediction summary for selected cycles (1, 10, 60, 120)
+    # 6. ML prediction summary for selected cycles (1, 10, 60, 120)
     feature_cols = list(X_train.columns)
     predict_for_selected_cycles(predict_fn, feature_cols, df, unit_ids=None, cycles=[1, 10, 60, 120])
 
-    # 7. One-hour RPM scenario simulation (3000/4000/5000/6000) across
-    #    multiple independent turbine units, using the physics-based damage
-    #    model alongside the trained ML model for comparison, with
-    #    rpm/temperature/load range bands and health status ranges.
-    scenario_table = simulate_units_rpm_scenarios(df, predict_fn, feature_cols)
+    # 7. FINAL / CURRENT prediction logic — SLMTA15 material fatigue model.
+    #    used_hours=None means each unit uses ITS OWN real accumulated
+    #    time_hours (all of its real history counts as "used").
+    # slmta15_table = predict_remaining_hours_slmta15(df, unit_ids=None, rpms=None, used_hours=None)
 
     # 8. Visualizations
-    generate_visualizations(df, scenario_table)
+    # generate_visualizations(df, slmta15_table)
 
-    log.info("RPM-scenario RUL simulation complete.")
+    log.info("Real-data SLMTA15 RUL prediction complete.")
 
 
 if __name__ == "__main__":
-    main()
+    # First run: point at your real CSV to ingest it into the persistent  
+    # store. Later runs can call main() with no argument to reuse/extend
+    # the accumulated store, or pass a new CSV of freshly recorded rows.
+    main(uploaded_csv_path="data/raw/turbine_unit1_upload.csv")

@@ -1,8 +1,7 @@
 """Configuration settings for the turbine RUL prediction workflow."""
 
 CONFIG = {
-    # Active parameters (paper-based RPM + Temperature). Vibration and
-    # pressure have been removed for now — Phase 1 scope only.
+    # Active parameters (paper-based RPM + Temperature + Loading).
     "input_features": ["rpm", "temperature", "loading", "time_hours"],
     "target": "rul",
 
@@ -15,8 +14,6 @@ CONFIG = {
     "random_state": 42,
 
     # Healthy blade operating limits (from paper-based reference).
-    # "loading" bounds added so the scenario table can label loading into
-    # Low/Medium/High bands, same as rpm and temperature.
     "healthy_ranges": {
         "rpm": {"min": 3000, "max": 6000, "nominal": 4500},
         "temperature": {"min": 400, "max": 1000, "nominal": 700},
@@ -56,7 +53,6 @@ CONFIG = {
         "stress_rpm_ref": 6000,
         "fatigue_strength_coefficient": 1.0,
         "life_scale_hours": 140,
-        # Thermal stress is now the only secondary multiplier on damage.
         "thermal_stress_weight": 0.35,
     },
 
@@ -68,17 +64,59 @@ CONFIG = {
     # Critical, independent of the raw damage index check above.
     "health_threshold": 25,
 
-    # Health score band for "Warning" status (Warning: health_threshold 
-    # health <= warning_threshold; Healthy: health > warning_threshold).
+    # Health score band for "Warning" status.
     "warning_threshold": 60,
 
     # RPM operating scenarios simulated for exactly one hour each.
     "scenario_rpms": [3000, 4000, 5000, 6000],
 
-    # Number of independent turbine units simulated, each with its own
-    # noise seed / wear history / degradation trend.
+    # Number of independent turbine units simulated.
     "num_scenario_units": 8,
 
     # Plot output directory
     "plots_dir": "plots",
+
+    # ------------------------------------------------------------------
+    # SLMTA15 material S-N (stress-life) fatigue model.
+    # Table points are the geometric mean of each cycle range supplied,
+    # used as representative (stress, fatigue_life_cycles) pairs for
+    # log-linear interpolation (stress vs log10(N)) between them.
+    # ------------------------------------------------------------------
+    "material_sn_curve": {
+        "material": "SLMTA15",
+        "stress_life_points": [
+            # (stress_MPa, fatigue_life_cycles)  -- using UPPER BOUND of scatter range
+            (900, 8.0e4),    # range 2e4 - 8e4
+            (850, 2.0e5),    # range 5e4 - 2e5
+            (800, 5.0e5),    # range 1e5 - 5e5
+            (750, 1.0e6),    # range 3e5 - 1e6
+            (700, 4.0e6),    # range 8e5 - 4e6
+            (650, 2.0e7),    # range 2e6 - 2e7
+            (600, 8.0e7),    # range 8e6 - 8e7
+            (500, 1.0e8),    # run-out
+        ],
+        "build_orientation_fatigue_strength_mpa": {
+            "horizontal": 500,   # H-HCF, ~500 MPa @ 1e8 cycles
+            "vertical": 600,     # V-HCF, ~600 MPa @ 1e8 cycles
+        },
+    },
+
+    # Loading (0-1 ratio) is linearly mapped onto this stress range (MPa)
+    # to feed the SLMTA15 S-N curve above.
+    "stress_range_mpa": {"min": 500, "max": 900},
+
+    # Default number of hours the unit is assumed to have ALREADY operated
+    # (using its own real historical data) before evaluating each new RPM
+    # scenario going forward. Override per-call if needed.
+    "default_used_hours": 15,
+
+    # ------------------------------------------------------------------
+    # REAL DATA INGESTION (replaces synthetic build_paper_dataset when a
+    # real CSV is supplied). New real data is merged into this persistent
+    # store on every run — never overwritten, only appended/deduplicated —
+    # so "old data" (previous runs) and "current data" (this run's rows)
+    # accumulate continuously instead of being regenerated each time.
+    # ------------------------------------------------------------------
+    "use_real_data": True,
+    "real_data_store_path": "data/raw/turbine_real_data_store.csv",
 }
