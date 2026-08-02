@@ -32,8 +32,8 @@ torch>=2.0          # PyTorch — install separately via pytorch.org for GPU
 
 # ── MLOps & Serving ─────────────────────────────────────
 # mlflow>=2.0       # Uncomment Phase 5: Experiment tracking
-# fastapi>=0.100    # Uncomment Phase 5: REST API deployment
-# uvicorn>=0.22     # Uncomment Phase 5: ASGI server
+fastapi>=0.110
+uvicorn>=0.22
 
 # ── Visualization ───────────────────────────────────────
 matplotlib>=3.7

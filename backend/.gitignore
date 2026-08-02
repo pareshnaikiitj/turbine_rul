@@ -19,6 +19,7 @@ sdist/
 var/
 wheels/
 *.whl
+.pytest_cache
 
 # Virtual environments
 .venv/
@@ -33,6 +34,7 @@ ENV/
 # Data — raw and processed data are not versioned
 data/raw/
 data/processed/
+data/output/
 
 # Logs
 logs/
@@ -53,3 +55,6 @@ desktop.ini
 
 # AutoGluon artifacts
 ag-*
+
+# Plots
+plots
