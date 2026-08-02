@@ -1,0 +1,76 @@
+import React from 'react';
+import { useTurbineSimulation } from '../hooks/useTurbineSimulation';
+import { dashboardStyles } from './dashboardStyles';
+import SimulationControls from './SimulationControls';
+import SimulationResults from './SimulationResults';
+
+const metricCards = [
+  { label: 'MODEL', value: 'RandomForest' },
+  { label: 'TEST MAE', value: '1.83 hrs' },
+  { label: 'TEST RMSE', value: '2.53 hrs' },
+  { label: 'R² SCORE', value: '0.9649' },
+];
+
+export default function TurbineRulDashboard() {
+  const sim = useTurbineSimulation();
+
+  return (
+    <div className="dashboard-shell">
+      <style>{dashboardStyles}</style>
+
+      <header className="top-bar">
+        <div className="top-bar__left">
+          <span className="brand-icon">◌</span>
+          <span className="brand-label">Turbine RUL Dashboard</span>
+        </div>
+      </header>
+
+      <section className="hero-panel">
+        <div className="hero-panel__title-row">
+          <span className="level-badge">M25DE2039 TURBINE BLADE RUL</span>
+        </div>
+        <h1>Remaining Useful Life Console</h1>
+        <p>ML predictions, SLMTA15 fatigue model &amp; degradation trajectory</p>
+        <div className="cycle-pills">
+          {[1, 2, 3, 4, 5, 6, 7, 8].map((item) => (
+            <span key={item} className={item === 1 ? 'pill active' : 'pill'}>
+              {item}
+            </span>
+          ))}
+        </div>
+      </section>
+
+      <section className="stats-grid">
+        {metricCards.map((card) => (
+          <article key={card.label} className="stat-card">
+            <div className="stat-card__label">{card.label}</div>
+            <div className="stat-card__value">{card.value}</div>
+          </article>
+        ))}
+      </section>
+
+      <SimulationControls
+        form={sim.form}
+        onChange={sim.handleChange}
+        onSimulate={sim.runSimulation}
+        isLoading={sim.isLoading}
+        error={sim.error}
+      />
+
+      {sim.result ? (
+        <SimulationResults
+          pagedRows={sim.pagedRows}
+          rowsCount={sim.rows.length}
+          page={sim.page}
+          totalPages={sim.totalPages}
+          goToPage={sim.goToPage}
+          pageSize={sim.pageSize}
+          estimatedLifeHours={sim.estimatedLifeHours}
+          displayedRpm={sim.displayedRpm}
+          displayedStress={sim.displayedStress}
+          displayedMaxHours={sim.displayedMaxHours}
+        />
+      ) : null}
+    </div>
+  );
+}
