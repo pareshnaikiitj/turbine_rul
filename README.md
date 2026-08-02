@@ -55,7 +55,7 @@ npm run dev -- --host 0.0.0.0
 
 ```bash
 # Backend API (when your current working directory is backend/)
-python -m uvicorn api:app --host 127.0.0.1 --port 8001
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
 > Use `backend.api:app` only when the shell is started from the repository root. If you are already inside the `backend/` folder, use `api:app` instead.
