@@ -1,23 +1,16 @@
 import React from 'react';
 import { useTurbineSimulation } from '../hooks/useTurbineSimulation';
-import { dashboardStyles } from './dashboardStyles';
+import { useModelMetrics } from '../hooks/useModelMetrics';
 import SimulationControls from './SimulationControls';
 import SimulationResults from './SimulationResults';
-
-const metricCards = [
-  { label: 'MODEL', value: 'RandomForest' },
-  { label: 'TEST MAE', value: '1.83 hrs' },
-  { label: 'TEST RMSE', value: '2.53 hrs' },
-  { label: 'R² SCORE', value: '0.9649' },
-];
+import CsvUploadPredictions from './CsvUploadPredictions';
 
 export default function TurbineRulDashboard() {
   const sim = useTurbineSimulation();
+  const { metricCards, error: metricsError } = useModelMetrics();
 
   return (
     <div className="dashboard-shell">
-      <style>{dashboardStyles}</style>
-
       <header className="top-bar">
         <div className="top-bar__left">
           <span className="brand-icon">◌</span>
@@ -49,6 +42,10 @@ export default function TurbineRulDashboard() {
         ))}
       </section>
 
+      {metricsError ? (
+        <div className="banner">Couldn't load model metrics: {metricsError}</div>
+      ) : null}
+
       <SimulationControls
         form={sim.form}
         onChange={sim.handleChange}
@@ -71,6 +68,8 @@ export default function TurbineRulDashboard() {
           displayedMaxHours={sim.displayedMaxHours}
         />
       ) : null}
+
+      <CsvUploadPredictions />
     </div>
   );
 }
