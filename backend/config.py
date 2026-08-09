@@ -1,15 +1,22 @@
 """Configuration settings for the turbine RUL prediction workflow."""
 
+import os
+
+# Anchor all paths to this file's own location (backend/), so the app
+# resolves data/models/plots correctly no matter which directory you
+# launch uvicorn / python from (repo root, backend/, etc.).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG = {
     # Active parameters (paper-based RPM + Temperature + Loading + Vibration + Pressure).
-    "input_features": ["rpm", "temperature", "loading", "time_hours", "vibration", "pressure"],
+    "input_features": ["rpm", "loading", "time_hours", "vibration", "pressure"],
     "target": "rul",
 
     # Data paths
-    "journal_data_path": "data/raw/journal_paper_turbine_data.csv",
-    "processed_path": "data/processed/features.csv",
-    "predictions_path": "data/processed/latest_unit_predictions.csv",
-    "scenario_table_path": "data/processed/rpm_scenario_table.csv",
+    "journal_data_path": os.path.join(BASE_DIR, "data", "raw", "journal_paper_turbine_data.csv"),
+    "processed_path": os.path.join(BASE_DIR, "data", "processed", "features.csv"),
+    "predictions_path": os.path.join(BASE_DIR, "data", "processed", "latest_unit_predictions.csv"),
+    "scenario_table_path": os.path.join(BASE_DIR, "data", "processed", "rpm_scenario_table.csv"),
     "test_size": 0.2,
     "random_state": 42,
 
@@ -43,7 +50,7 @@ CONFIG = {
     },
 
     # Model paths
-    "model_dir": "models/autogluon_rul",
+    "model_dir": os.path.join(BASE_DIR, "models", "autogluon_rul"),
 
     # ------------------------------------------------------------------
     # Degradation model constants (Basquin's equation + Palmgren-Miner
@@ -76,7 +83,7 @@ CONFIG = {
     "num_scenario_units": 8,
 
     # Plot output directory
-    "plots_dir": "plots",
+    "plots_dir": os.path.join(BASE_DIR, "plots"),
 
     # ------------------------------------------------------------------
     # SLMTA15 material S-N (stress-life) fatigue model.
@@ -119,5 +126,5 @@ CONFIG = {
     # accumulate continuously instead of being regenerated each time.
     # ------------------------------------------------------------------
     "use_real_data": True,
-    "real_data_store_path": "data/raw/turbine_real_data_store.csv",
+    "real_data_store_path": os.path.join(BASE_DIR, "data", "raw", "turbine_real_data_store.csv"),
 }

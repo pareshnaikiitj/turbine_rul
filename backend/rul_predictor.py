@@ -6,7 +6,7 @@ Author   : Paresh Naik | Roll No: M25DE2039
 Guide    : Dr. Ambuj Kumar Gautam
 Branch   : Data Engineering (M.Tech)
 
-Stage    : Phase 1 — Parameters (RPM, Temperature, Loading)
+Stage    : Phase 1 — Parameters (RPM, stress, Loading)
 Later    : Add vibration, pressure, etc.
 """
 
@@ -18,13 +18,14 @@ import warnings
 import logging
 import os
 import time
+import threading
 import contextlib
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from config import CONFIG
+from config import CONFIG, BASE_DIR
 
 warnings.filterwarnings("ignore")
 
@@ -34,7 +35,16 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-os.makedirs("logs", exist_ok=True)
+# All runtime paths (logs, data output, uploads) are anchored to
+# backend/ via BASE_DIR (imported from config.py) so this script behaves
+# identically whether it's run directly, imported by api.py, or launched
+# from a different working directory.
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+OUTPUT_DIR = os.path.join(DATA_DIR, "output")
+RAW_UPLOAD_DEFAULT = os.path.join(DATA_DIR, "raw", "turbine_unit1_upload.csv")
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────
 # Logging
@@ -42,7 +52,7 @@ os.makedirs("logs", exist_ok=True)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
-file_handler = logging.FileHandler("logs/rul_training.log", encoding="utf-8")
+file_handler = logging.FileHandler(os.path.join(LOGS_DIR, "rul_training.log"), encoding="utf-8")
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 
@@ -106,14 +116,14 @@ def build_paper_dataset() -> pd.DataFrame:
 
     rng = np.random.default_rng(CONFIG["random_state"])
     cases = [
-        {"unit_id": 1, "rpm": paper["reported_rpm"], "temp_start": 500, "temp_end": 900, "life": 120},
-        {"unit_id": 2, "rpm": 5200, "temp_start": 520, "temp_end": 920, "life": 110},
-        {"unit_id": 3, "rpm": 4800, "temp_start": 480, "temp_end": 880, "life": 130},
-        {"unit_id": 4, "rpm": 5600, "temp_start": 540, "temp_end": 940, "life": 100},
-        {"unit_id": 5, "rpm": 4200, "temp_start": 450, "temp_end": 860, "life": 140},
-        {"unit_id": 6, "rpm": 5000, "temp_start": 560, "temp_end": 900, "life": 90},
-        {"unit_id": 7, "rpm": 5400, "temp_start": 530, "temp_end": 910, "life": 115},
-        {"unit_id": 8, "rpm": 5800, "temp_start": 550, "temp_end": 950, "life": 105},
+        {"unit_id": 1, "rpm": paper["reported_rpm"], "life": 120},
+        {"unit_id": 2, "rpm": 5200, "life": 110},
+        {"unit_id": 3, "rpm": 4800, "life": 130},
+        {"unit_id": 4, "rpm": 5600, "life": 100},
+        {"unit_id": 5, "rpm": 4200, "life": 140},
+        {"unit_id": 6, "rpm": 5000, "life": 90},
+        {"unit_id": 7, "rpm": 5400, "life": 115},
+        {"unit_id": 8, "rpm": 5800, "life": 105},
     ]
 
     rows = []
@@ -121,12 +131,8 @@ def build_paper_dataset() -> pd.DataFrame:
         unit_id = case["unit_id"]
         life = case["life"]
         for cycle in range(1, life + 1):
-            degradation = cycle / life
             rpm_noise = rng.normal(0, 35)
             rpm = float(np.clip(case["rpm"] + rpm_noise, healthy["rpm"]["min"], healthy["rpm"]["max"]))
-            temperature_noise = rng.normal(0, 2.5)
-            temperature = case["temp_start"] + (case["temp_end"] - case["temp_start"]) * degradation + temperature_noise
-            temperature = float(np.clip(temperature, healthy["temperature"]["min"], healthy["temperature"]["max"]))
             loading, time_hours = calculate_loading_and_time(rpm, cycle, life, healthy)
             vibration, pressure = calculate_vibration_and_pressure(rpm, cycle, life, healthy)
             rul = max(0, life - cycle)
@@ -134,7 +140,6 @@ def build_paper_dataset() -> pd.DataFrame:
                 "unit_id": unit_id,
                 "cycle": cycle,
                 "rpm": round(rpm, 2),
-                "temperature": round(temperature, 2),
                 "loading": loading,
                 "time_hours": time_hours,
                 "vibration": vibration,
@@ -161,8 +166,19 @@ def load_and_store_real_data(uploaded_csv_path: str) -> pd.DataFrame:
     store_path = CONFIG["real_data_store_path"]
     os.makedirs(os.path.dirname(store_path), exist_ok=True)
 
+    if not os.path.isabs(uploaded_csv_path):
+        # Resolve any relative path the caller passes in against backend/,
+        # not against whatever directory the process happened to launch from.
+        uploaded_csv_path = os.path.join(BASE_DIR, uploaded_csv_path)
+
+    if not os.path.exists(uploaded_csv_path):
+        raise FileNotFoundError(
+            f"Uploaded CSV not found at {uploaded_csv_path}. "
+            f"Place your file at {RAW_UPLOAD_DEFAULT} or pass a full path."
+        )
+
     new_data = pd.read_csv(uploaded_csv_path)
-    required_cols = {"unit_id", "cycle", "rpm", "temperature", "loading", "time_hours", "rul"}
+    required_cols = {"unit_id", "cycle", "rpm", "loading", "time_hours", "vibration", "pressure", "rul"}
     missing = required_cols - set(new_data.columns)
     if missing:
         raise ValueError(f"Uploaded real data is missing required columns: {missing}")
@@ -352,9 +368,8 @@ def predict_remaining_hours_slmta15(df_history: pd.DataFrame,
 
     out = pd.DataFrame(rows)
 
-    output_dir = "data/output"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "rul_slmta15_material_model.csv")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, "rul_slmta15_material_model.csv")
     out.to_csv(output_path, index=False)
     log.info(f"Saved SLMTA15 material-model remaining-hours table to {output_path}")
 
@@ -451,9 +466,8 @@ def simulate_fresh_turbine_to_failure(rpm: float, stress_mpa: float | None = Non
 
     out = pd.DataFrame(rows)
 
-    output_dir = "data/output"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"fresh_turbine_degradation_rpm{int(rpm)}.csv")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, f"fresh_turbine_degradation_rpm{int(rpm)}.csv")
     out.to_csv(output_path, index=False)
     log.info(f"Saved fresh-turbine degradation curve (rpm={rpm}) to {output_path}")
 
@@ -501,12 +515,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f"{feat}_lag1"] = df.groupby("unit_id")[feat].shift(1).bfill()
         df[f"{feat}_diff"] = df.groupby("unit_id")[feat].diff().fillna(0)
 
-    baseline_temp = healthy["temperature"]["nominal"]
     baseline_rpm = healthy["rpm"]["nominal"]
     baseline_vibration = healthy["vibration"]["nominal"]
     baseline_pressure = healthy["pressure"]["nominal"]
 
-    df["temp_rise"] = df.groupby("unit_id")["temperature"].diff().fillna(0)
     df["loading_rise"] = df.groupby("unit_id")["loading"].diff().fillna(0)
     df["rpm_rise"] = df.groupby("unit_id")["rpm"].diff().fillna(0)
     df["vibration_rise"] = df.groupby("unit_id")["vibration"].diff().fillna(0)
@@ -517,7 +529,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["cycle_progress"] = df["cycle_progress"].fillna(0)
 
     df["cdi"] = (
-        df.groupby("unit_id")["temperature"].transform(lambda x: ((x - baseline_temp).clip(lower=0).cumsum()))
         + df.groupby("unit_id")["rpm"].transform(lambda x: ((x - baseline_rpm).abs().cumsum()))
         + df.groupby("unit_id")["vibration"].transform(lambda x: ((x - baseline_vibration).clip(lower=0).cumsum()))
         + df.groupby("unit_id")["pressure"].transform(lambda x: ((x - baseline_pressure).clip(lower=0).cumsum()))
@@ -646,6 +657,85 @@ def train_final_model(X_train, y_train, X_test, y_test):
 
 
 # ─────────────────────────────────────────────
+# 4b. Cached model trainer — used by the API so /metrics, /predict, etc.
+#     don't retrain from scratch on every single request.
+# ─────────────────────────────────────────────
+_model_cache = {
+    "data_fingerprint": None,
+    "model_name": None,
+    "predict_fn": None,
+    "metrics": None,
+    "feature_cols": None,
+}
+_cache_lock = threading.Lock()
+
+
+def get_trained_model(force_retrain: bool = False) -> dict:
+    """
+    Train the final model once and cache it in memory (module-level, so it
+    persists for the lifetime of the API process). Automatically retrains
+    if the underlying real-data store has changed — detected via a cheap
+    fingerprint (row count + set of unit_ids) — since the last cached run.
+
+    Returns a dict: {model_name, predict_fn, metrics, feature_cols}.
+    """
+    global _model_cache
+
+    df_raw = load_paper_dataset(uploaded_csv_path=None)
+    fingerprint = (len(df_raw), tuple(sorted(df_raw["unit_id"].unique())))
+
+    with _cache_lock:
+        if (
+            not force_retrain
+            and _model_cache["model_name"] is not None
+            and _model_cache["data_fingerprint"] == fingerprint
+        ):
+            return _model_cache
+
+        df = engineer_features(df_raw)
+        X_train, X_test, y_train, y_test = split_data(df)
+        model_name, predict_fn, metrics = train_final_model(X_train, y_train, X_test, y_test)
+
+        _model_cache = {
+            "data_fingerprint": fingerprint,
+            "model_name": model_name,
+            "predict_fn": predict_fn,
+            "metrics": metrics,
+            "feature_cols": list(X_train.columns),
+        }
+        log.info(
+            f"Model cache (re)trained: {model_name} | "
+            f"MAE={metrics['mae']:.2f} RMSE={metrics['rmse']:.2f} R2={metrics['r2']:.4f}"
+        )
+        return _model_cache
+
+def predict_rul_for_sensor_reading(payload: dict) -> float:
+    """
+    Run a single live sensor reading (as sent by the /predict API endpoint)
+    through the SAME cached trained model + feature pipeline used for
+    /metrics, instead of a separate hand-rolled formula.
+    """
+    cache = get_trained_model()
+    predict_fn = cache["predict_fn"]
+    feature_cols = cache["feature_cols"]
+
+    case_df = pd.DataFrame([{
+        "unit_id": int(payload.get("unit_id", 1)),
+        "cycle": int(payload.get("cycle", 1)),
+        "rpm": float(payload["rpm"]),
+        "loading": float(payload["loading"]),
+        "time_hours": float(payload["time_hours"]),
+        "vibration": float(payload.get("vibration", 0.0)),
+        "pressure": float(payload.get("pressure", 0.0)),
+        "rul": 0,
+    }])
+    case_df = engineer_features(case_df)
+    case_df = case_df.reindex(columns=feature_cols, fill_value=0)
+    pred_rul = float(predict_fn(case_df[feature_cols])[0])
+    return pred_rul    
+
+
+# ─────────────────────────────────────────────
 # 5. Display + Combined ML Prediction Summary
 # ─────────────────────────────────────────────
 def display_final_model_results(model_name: str, metrics: dict):
@@ -656,7 +746,9 @@ def display_final_model_results(model_name: str, metrics: dict):
     print(f"Test RMSE: {metrics['rmse']:.2f} hours")
     print(f"Test R2: {metrics['r2']:.4f}")
 
-
+# ─────────────────────────────────────────────
+# 6. Predict For Selected Cycles
+# ─────────────────────────────────────────────
 def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
                                  unit_ids: list | None = None,
                                  cycles: list | None = None) -> pd.DataFrame:
@@ -686,7 +778,6 @@ def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
                 "unit_id": int(row["unit_id"]),
                 "cycle": int(row["cycle"]),
                 "rpm": float(row["rpm"]),
-                "temperature": float(row["temperature"]),
                 "loading": float(row["loading"]),
                 "time_hours": float(row["time_hours"]),
                 "vibration": float(row.get("vibration", 0.0)),
@@ -701,7 +792,6 @@ def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
                 "unit_id": int(row["unit_id"]),
                 "cycle": int(row["cycle"]),
                 "rpm": round(float(row["rpm"]), 2),
-                "temperature": round(float(row["temperature"]), 2),
                 "loading": round(float(row["loading"]), 3),
                 "time_hours": round(float(row["time_hours"]), 2),
                 "vibration": round(float(row.get("vibration", 0.0)), 3),
@@ -713,6 +803,84 @@ def predict_for_selected_cycles(predict_fn, feature_cols, df: pd.DataFrame,
     out = pd.DataFrame(rows)
     print("\n=== Turbine RUL Prediction Summary (All Units) ===")
     print(out.to_string(index=False))
+    return out
+
+# ─────────────────────────────────────────────
+# 6b. Bulk CSV prediction — used by the /predict-csv upload endpoint
+# ─────────────────────────────────────────────
+REQUIRED_PREDICT_COLUMNS = {"unit_id", "cycle", "rpm", "loading", "time_hours", "vibration", "pressure"}
+
+
+def get_health_thresholds() -> dict:
+    """Exposes the CONFIG-driven health/warning bands so the frontend can
+    render a legend instead of guessing at hardcoded numbers."""
+    return {
+        "health_threshold": CONFIG["health_threshold"],
+        "warning_threshold": CONFIG["warning_threshold"],
+        "failure_threshold": CONFIG["failure_threshold"],
+        "life_scale_hours": CONFIG["degradation_model"]["life_scale_hours"],
+    }
+
+
+def _status_from_rul(predicted_hours: float, life_scale_hours: float | None = None) -> tuple[str, float]:
+    """
+    Maps a predicted RUL (hours) onto a health_score (0 = failed, 100 = new)
+    and a status label, using the SAME health_threshold / warning_threshold
+    bands from CONFIG that simulate_fresh_turbine_to_failure uses.
+    """
+    scale = life_scale_hours or CONFIG["degradation_model"]["life_scale_hours"]
+    health_score = float(np.clip(100.0 * (predicted_hours / max(1e-9, scale)), 0.0, 100.0))
+
+    if health_score <= CONFIG["health_threshold"]:
+        status = "Critical"
+    elif health_score <= CONFIG["warning_threshold"]:
+        status = "Warning"
+    else:
+        status = "Healthy"
+    return status, round(health_score, 1)
+
+
+def predict_rul_for_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run an uploaded CSV of turbine readings through the SAME cached trained
+    model + feature pipeline used by /metrics and /predict, returning one
+    predicted_rul_hours per input row. A 'rul' column is NOT required —
+    this is pure inference, not training. If 'rul' IS present it's carried
+    through as actual_rul_hours for comparison.
+    """
+    if df.empty:
+        raise ValueError("Uploaded CSV has no rows.")
+
+    missing = REQUIRED_PREDICT_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"Uploaded CSV is missing required columns: {sorted(missing)}")
+
+    df = df.copy()
+    has_actual_rul = "rul" in df.columns
+
+    df_for_features = df.copy()
+    if not has_actual_rul:
+        df_for_features["rul"] = 0
+
+    cache = get_trained_model()
+    predict_fn = cache["predict_fn"]
+    feature_cols = cache["feature_cols"]
+
+    engineered = engineer_features(df_for_features)
+    X = engineered.reindex(columns=feature_cols, fill_value=0)
+    predictions = np.asarray(predict_fn(X[feature_cols]))
+    predictions = np.clip(predictions, 0, None)
+
+    out = df[["unit_id", "cycle", "rpm", "loading", "time_hours", "vibration", "pressure"]].copy()
+    if has_actual_rul:
+        out["actual_rul_hours"] = df["rul"].astype(float)
+
+    out["predicted_rul_hours"] = np.round(predictions, 2)
+    statuses, health_scores = zip(*[_status_from_rul(p) for p in predictions])
+    out["health_score"] = health_scores
+    out["status"] = statuses
+
+    out = out.sort_values(["unit_id", "cycle"]).reset_index(drop=True)
     return out
 
 # ─────────────────────────────────────────────
@@ -791,6 +959,10 @@ def main(uploaded_csv_path: str | None = None):
     OLD DATA from previous runs. If omitted, the accumulated store on disk
     is reused as-is (or, if no store exists yet, falls back to synthetic
     data so the pipeline never crashes on a first-time setup).
+
+    A relative uploaded_csv_path is resolved against backend/ (BASE_DIR),
+    so "data/raw/x.csv" always means backend/data/raw/x.csv regardless of
+    the current working directory the script was launched from.
     """
     log.info("=" * 55)
     log.info("  Turbine RUL Prediction — Real-Data + SLMTA15 Material Model")
@@ -801,10 +973,10 @@ def main(uploaded_csv_path: str | None = None):
     log.info(f"Source paper: {paper['title']} ({paper['journal']})")
     log.info(f"Run seed: {RUN_SEED}")
     log.info(
-        f"Healthy blade limits → RPM {healthy['rpm']['min']}-{healthy['rpm']['max']} (nominal {healthy['rpm']['nominal']}) | "
-        f"Temperature {healthy['temperature']['min']}-{healthy['temperature']['max']} K "
-        f"({healthy['temperature']['min']-273.15:.0f}°C-{healthy['temperature']['max']-273.15:.0f}°C; nominal {healthy['temperature']['nominal']-273.15:.0f}°C)"
-    )
+            f"Healthy blade limits → RPM {healthy['rpm']['min']}-{healthy['rpm']['max']} (nominal {healthy['rpm']['nominal']}) | "
+            f"Vibration {healthy['vibration']['min']}-{healthy['vibration']['max']} | "
+            f"Pressure {healthy['pressure']['min']}-{healthy['pressure']['max']}"
+        )
 
     # Example 1: Industrial Gas Turbine (3000 rpm, fixed stress = 700 MPa)
     simulate_fresh_turbine_to_failure(rpm=4000, stress_mpa=600)
@@ -828,7 +1000,7 @@ def main(uploaded_csv_path: str | None = None):
 
     # 2. Features
     df = engineer_features(df)
-    os.makedirs("data/processed", exist_ok=True)
+    os.makedirs(os.path.dirname(CONFIG["processed_path"]), exist_ok=True)
     df.to_csv(CONFIG["processed_path"], index=False)
 
     # 3. Split — by whole unit, no leakage
@@ -838,8 +1010,7 @@ def main(uploaded_csv_path: str | None = None):
     model_name, predict_fn, metrics = train_final_model(X_train, y_train, X_test, y_test)
 
     # 5. Combined display — one block, one model
-    # display_final_model_results(model_name, metrics)
-    
+    display_final_model_results(model_name, metrics)
 
     # 6. ML prediction summary for selected cycles (1, 10, 60, 120)
     feature_cols = list(X_train.columns)
@@ -857,7 +1028,9 @@ def main(uploaded_csv_path: str | None = None):
 
 
 if __name__ == "__main__":
-    # First run: point at your real CSV to ingest it into the persistent  
+    # First run: point at your real CSV to ingest it into the persistent
     # store. Later runs can call main() with no argument to reuse/extend
     # the accumulated store, or pass a new CSV of freshly recorded rows.
-    main(uploaded_csv_path="data/raw/turbine_unit1_upload.csv")
+    # This path is resolved against backend/ automatically (see main()'s
+    # docstring), so drop your file at backend/data/raw/turbine_unit1_upload.csv.
+    main(uploaded_csv_path=RAW_UPLOAD_DEFAULT)
