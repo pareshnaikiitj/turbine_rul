@@ -1,13 +1,17 @@
 import React from 'react';
 import { useTurbineSimulation } from '../hooks/useTurbineSimulation';
 import { useModelMetrics } from '../hooks/useModelMetrics';
+import { useCsvRulPrediction } from '../hooks/useCsvRulPrediction';
 import SimulationControls from './SimulationControls';
 import SimulationResults from './SimulationResults';
+import CsvUploadControls from './CsvUploadControls';
 import CsvUploadPredictions from './CsvUploadPredictions';
+import ParameterTrends from './ParameterTrends';
 
 export default function TurbineRulDashboard() {
   const sim = useTurbineSimulation();
   const { metricCards, error: metricsError } = useModelMetrics();
+  const csv = useCsvRulPrediction();
 
   return (
     <div className="dashboard-shell">
@@ -69,7 +73,26 @@ export default function TurbineRulDashboard() {
         />
       ) : null}
 
-      <CsvUploadPredictions />
+      <CsvUploadControls
+        selectedFile={csv.selectedFile}
+        handleFileSelect={csv.handleFileSelect}
+        runPrediction={csv.runPrediction}
+        reset={csv.reset}
+        isLoading={csv.isLoading}
+        error={csv.error}
+        result={csv.result}
+      />
+
+      <ParameterTrends rows={csv.rows} />
+
+      <CsvUploadPredictions
+        result={csv.result}
+        pagedRows={csv.pagedRows}
+        rows={csv.rows}
+        page={csv.page}
+        totalPages={csv.totalPages}
+        goToPage={csv.goToPage}
+      />
     </div>
   );
 }

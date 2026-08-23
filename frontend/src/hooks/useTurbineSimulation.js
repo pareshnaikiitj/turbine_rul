@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { runFailureSimulation, DEFAULT_MAX_HOURS } from '../api/turbineSimulationApi';
 
-const PAGE_SIZE = 8;
+const PAGE_SIZE = 10;
 
 const initialForm = {
-  rpm: 4000,
-  stress_mpa: 500,
+  rpm: 3000,
+  stress_mpa: 300,
 };
 
 /**
