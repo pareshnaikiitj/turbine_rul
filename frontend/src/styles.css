@@ -622,3 +622,8 @@ tbody tr:hover { background: rgba(34,211,238,0.03); }
 @media (max-width: 640px) {
   .chart-grid { grid-template-columns: 1fr; }
 }
+
+
+
+
+
