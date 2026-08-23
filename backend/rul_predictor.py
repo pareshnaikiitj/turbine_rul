@@ -261,16 +261,33 @@ def _stress_from_loading(loading: float) -> float:
 
 def _fatigue_life_cycles_slmta15(stress_mpa: float) -> float:
     """
-    Interpolate fatigue life (cycles to failure) for SLMTA15 at a given
-    stress, using stress vs log10(N) linear interpolation between the
-    table points in CONFIG["material_sn_curve"]. Stress is clipped to the
-    table's own bounds (500-900 MPa) to avoid extrapolation.
+    Fatigue life (cycles to failure) for SLMTA15 at a given stress, using
+    stress vs log10(N) linear interpolation between the table points in
+    CONFIG["material_sn_curve"]. Basquin-type S-N curves are linear in
+    log-log space by construction, so a stress outside the table's own
+    500-900 MPa envelope is extrapolated along the nearest segment's slope
+    rather than clipped to the boundary — clipping made every stress below
+    500 (or above 900) collapse onto the same fatigue life, which read as
+    "stress isn't affecting the result" for any input outside that range.
+    The result is still clamped to a wide [10, 1e12] cycle band purely to
+    guard against runaway extrapolation on pathological inputs (e.g. near
+    0 MPa), not to flatten realistic values.
     """
     points = sorted(CONFIG["material_sn_curve"]["stress_life_points"], key=lambda p: p[0])
     stresses = [p[0] for p in points]
     log_lives = [np.log10(p[1]) for p in points]
-    stress_mpa = float(np.clip(stress_mpa, stresses[0], stresses[-1]))
-    log_n = float(np.interp(stress_mpa, stresses, log_lives))
+    stress_mpa = float(stress_mpa)
+
+    if stress_mpa <= stresses[0]:
+        slope = (log_lives[1] - log_lives[0]) / (stresses[1] - stresses[0])
+        log_n = log_lives[0] + slope * (stress_mpa - stresses[0])
+    elif stress_mpa >= stresses[-1]:
+        slope = (log_lives[-1] - log_lives[-2]) / (stresses[-1] - stresses[-2])
+        log_n = log_lives[-1] + slope * (stress_mpa - stresses[-1])
+    else:
+        log_n = float(np.interp(stress_mpa, stresses, log_lives))
+
+    log_n = float(np.clip(log_n, 1.0, 12.0))
     return float(10 ** log_n)
 
 
@@ -872,6 +889,7 @@ def predict_rul_for_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     predictions = np.clip(predictions, 0, None)
 
     out = df[["unit_id", "cycle", "rpm", "loading", "time_hours", "vibration", "pressure"]].copy()
+    out["stress_mpa"] = out["loading"].apply(lambda l: round(_stress_from_loading(float(l)), 1))
     if has_actual_rul:
         out["actual_rul_hours"] = df["rul"].astype(float)
 

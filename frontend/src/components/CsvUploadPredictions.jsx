@@ -1,5 +1,4 @@
 import React from 'react';
-import { useCsvRulPrediction } from '../hooks/useCsvRulPrediction';
 import { useHealthThresholds } from '../hooks/useHealthThresholds';
 
 const toneClass = {
@@ -8,23 +7,14 @@ const toneClass = {
   Critical: 'tone-critical',
 };
 
-export default function CsvUploadPredictions() {
-  const {
-    selectedFile,
-    handleFileSelect,
-    runPrediction,
-    reset,
-    isLoading,
-    error,
-    result,
-    pagedRows,
-    rows,
-    page,
-    totalPages,
-    goToPage,
-    pageSize,
-  } = useCsvRulPrediction();
-
+export default function CsvUploadPredictions({
+  result,
+  pagedRows,
+  rows,
+  page,
+  totalPages,
+  goToPage,
+}) {
   const { thresholds } = useHealthThresholds();
 
   return (
@@ -33,7 +23,7 @@ export default function CsvUploadPredictions() {
         <div>
           <div className="panel-title">Predict RUL from CSV</div>
           <div className="panel-subtitle">
-            Requires columns: unit_id, cycle, rpm, loading, time_hours, vibration, pressure
+            Columns: unit_id, cycle, rpm, loading, time_hours, vibration, pressure
             (rul optional)
         </div>
         </div>
@@ -53,29 +43,6 @@ export default function CsvUploadPredictions() {
           </span>
         </div>
       ) : null}
-
-      <div className="sim-controls">
-        <label>
-          CSV file
-          <input type="file" accept=".csv" onChange={handleFileSelect} />
-        </label>
-        <button onClick={runPrediction} disabled={isLoading || !selectedFile}>
-          {isLoading ? 'Predicting…' : 'Predict RUL'}
-        </button>
-        {result ? (
-          <button onClick={reset} disabled={isLoading}>
-            Clear
-          </button>
-        ) : null}
-      </div>
-
-      {selectedFile && !error ? (
-        <div className="panel-subtitle" style={{ marginTop: 10 }}>
-          Selected: {selectedFile.name}
-        </div>
-      ) : null}
-
-      {error ? <div className="banner">{error}</div> : null}
 
       {result ? (
         <>
@@ -151,7 +118,11 @@ export default function CsvUploadPredictions() {
             </div>
           </div>
         </>
-      ) : null}
+      ) : (
+        <div className="panel-subtitle" style={{ marginTop: 12 }}>
+          Upload and predict a CSV above to see results here.
+        </div>
+      )}
     </section>
   );
 }

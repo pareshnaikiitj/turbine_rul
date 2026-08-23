@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { uploadCsvForPrediction } from '../api/turbineUploadApi';
 
-const PAGE_SIZE = 8;
+const PAGE_SIZE = 10;
 
 /**
  * Encapsulates CSV selection, upload, and paginated results — mirrors
