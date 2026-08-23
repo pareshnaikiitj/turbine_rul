@@ -20,17 +20,18 @@
 ## Quick Start
 
 ```bash
-# 1) Install backend dependencies in the same Python environment that will launch the API
-pip install -r backend/requirements.txt
+# 1) Go to the backend folder and install its dependencies
+cd backend
+pip install -r requirements.txt
 
 # If the shell reports `No module named uvicorn`, install the API runtime explicitly
 python -m pip install uvicorn fastapi
 
-# 2) Start the FastAPI prediction API
+# 2) Start the FastAPI prediction API (from inside backend/)
 # If port 8000 is already occupied, stop the old process or start on another free port
-python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
 
-# 3) Install frontend dependencies
+# 3) In a new terminal, install frontend dependencies
 cd frontend
 npm install
 
@@ -38,27 +39,14 @@ npm install
 npm run dev -- --host 0.0.0.0
 ```
 
-### Run commands from the repository root
+### Backend command (always run from inside `backend/`)
 
 ```bash
-# Backend API (from repo root)
-python -m pip install uvicorn fastapi
-python -m uvicorn backend.api:app --host 0.0.0.0 --port 8000
-
-# Frontend
-cd frontend
-npm install
-npm run dev -- --host 0.0.0.0
+cd backend
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
-### Alternate backend command when already inside the backend folder
-
-```bash
-# Backend API (when your current working directory is backend/)
-python -m uvicorn api:app --host 127.0.0.1 --port 8000
-```
-
-> Use `backend.api:app` only when the shell is started from the repository root. If you are already inside the `backend/` folder, use `api:app` instead.
+> `api:app` refers to the `app` object in `backend/api.py`. Since the module is loaded as `api`, not `backend.api`, this command only works when your current working directory is `backend/` — always `cd backend` first.
 
 ---
 
