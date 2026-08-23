@@ -4,7 +4,7 @@ import { useModelMetrics } from '../hooks/useModelMetrics';
 import { useCsvRulPrediction } from '../hooks/useCsvRulPrediction';
 import SimulationControls from './SimulationControls';
 import SimulationResults from './SimulationResults';
-import CsvUploadControls from './CsvUploadcontrols';
+import CsvUploadControls from './FileUploadControls';
 import CsvUploadPredictions from './CsvUploadPredictions';
 import ParameterTrends from './ParameterTrends';
 
