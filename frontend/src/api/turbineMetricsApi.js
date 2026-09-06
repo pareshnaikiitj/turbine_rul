@@ -4,7 +4,7 @@
 
 // Vite exposes env vars prefixed with VITE_ via import.meta.env at build time.
 // Falls back to localhost so local dev still works if the .env file is missing.
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+import { API_BASE_URL } from './apiBaseUrl';
 
 /**
  * Fetch the trained model's headline metrics (model name, test MAE, test

@@ -7,7 +7,7 @@ Guide    : Dr. Ambuj Kumar Gautam
 Branch   : Data Engineering (M.Tech)
 
 Stage    : Phase 1 — Parameters (RPM, stress, Loading)
-Later    : Add vibration, pressure, etc.
+Stage    : Phase 2 — Parameters (vibration, pressure, etc.)
 """
 
 import sys
