@@ -38,6 +38,11 @@ export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel
       yMax += pad;
     }
 
+    if (yLabel.toLowerCase() === 'health') {
+      yMin = 0;
+      yMax = 100;
+    }
+
     const innerW = WIDTH - PAD.left - PAD.right;
     const innerH = HEIGHT - PAD.top - PAD.bottom;
     const scaleX = (x) => PAD.left + ((x - xMin) / (xMax - xMin)) * innerW;
