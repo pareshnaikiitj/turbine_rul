@@ -1,9 +1,10 @@
 import React, { useMemo, useState } from 'react';
 
-const WIDTH = 400;
-const HEIGHT = 220;
-const PAD = { top: 14, right: 16, bottom: 42, left: 66 };
+const WIDTH = 700;
+const HEIGHT = 320;
+const PAD = { top: 18, right: 22, bottom: 52, left: 74 };
 const RING = '#0b0f1e';
+const TICK_COUNT = 7;
 
 /**
  * Dependency-free SVG line chart. Plots one or more `series` (each its own
@@ -13,10 +14,10 @@ const RING = '#0b0f1e';
 export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel = '', unitSuffix = '' }) {
   const [hoverX, setHoverX] = useState(null);
 
-  const { plotted, xMin, xMax, yMin, yMax } = useMemo(() => {
+  const { plotted, xMin, xMax, yMin, yMax, xTicks, yTicks } = useMemo(() => {
     const nonEmpty = (series || []).filter((s) => s.data && s.data.length);
     if (!nonEmpty.length) {
-      return { plotted: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1 };
+      return { plotted: [], xMin: 0, xMax: 1, yMin: 0, yMax: 1, xTicks: [0, 1], yTicks: [0, 1] };
     }
 
     const allXs = nonEmpty.flatMap((s) => s.data.map((d) => Number(d[xKey])));
@@ -42,6 +43,9 @@ export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel
     const scaleX = (x) => PAD.left + ((x - xMin) / (xMax - xMin)) * innerW;
     const scaleY = (y) => PAD.top + innerH - ((y - yMin) / (yMax - yMin)) * innerH;
 
+    const xTicks = Array.from({ length: TICK_COUNT }, (_, i) => xMin + ((xMax - xMin) * i) / (TICK_COUNT - 1));
+    const yTicks = Array.from({ length: TICK_COUNT }, (_, i) => yMin + ((yMax - yMin) * i) / (TICK_COUNT - 1));
+
     const plotted = nonEmpty.map((s) => ({
       ...s,
       points: s.data.map((d) => ({
@@ -52,7 +56,7 @@ export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel
       })),
     }));
 
-    return { plotted, xMin, xMax, yMin, yMax };
+    return { plotted, xMin, xMax, yMin, yMax, xTicks, yTicks };
   }, [series, xKey, yKey]);
 
   if (!plotted.length) {
@@ -112,17 +116,39 @@ export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel
         ) : null}
       </defs>
 
-      {[0, 0.5, 1].map((t) => (
-        <line
-          key={t}
-          x1={PAD.left}
-          x2={WIDTH - PAD.right}
-          y1={PAD.top + t * (HEIGHT - PAD.top - PAD.bottom)}
-          y2={PAD.top + t * (HEIGHT - PAD.top - PAD.bottom)}
-          stroke="rgba(148,163,184,0.14)"
-          strokeWidth="1"
-        />
-      ))}
+      {yTicks.map((tick, index) => {
+        const y = PAD.top + ((HEIGHT - PAD.top - PAD.bottom) * (1 - index / (TICK_COUNT - 1)));
+        return (
+          <g key={`ytick-${tick}`}>
+            <line
+              x1={PAD.left}
+              x2={WIDTH - PAD.right}
+              y1={y}
+              y2={y}
+              stroke="rgba(148,163,184,0.14)"
+              strokeWidth="1"
+            />
+            <text x={PAD.left - 8} y={y + 4} className="chart-axis-label" textAnchor="end">{tick.toFixed(0)}</text>
+          </g>
+        );
+      })}
+
+      {xTicks.map((tick, index) => {
+        const x = PAD.left + ((WIDTH - PAD.left - PAD.right) * index) / (TICK_COUNT - 1);
+        return (
+          <g key={`xtick-${tick}`}>
+            <line
+              x1={x}
+              x2={x}
+              y1={PAD.top}
+              y2={HEIGHT - PAD.bottom}
+              stroke="rgba(148,163,184,0.08)"
+              strokeWidth="1"
+            />
+            <text x={x} y={HEIGHT - PAD.bottom + 18} className="chart-axis-label" textAnchor="middle">{tick.toFixed(0)}</text>
+          </g>
+        );
+      })}
 
       {showArea ? (
         <path
@@ -144,11 +170,6 @@ export default function LineChart({ series, xKey, yKey, xLabel = 'Cycle', yLabel
           opacity={hoverX === null ? 0.95 : 0.55}
         />
       ))}
-
-      <text x={PAD.left} y={HEIGHT - PAD.bottom + 18} className="chart-axis-label">{xMin.toFixed(0)}</text>
-      <text x={WIDTH - PAD.right} y={HEIGHT - PAD.bottom + 18} className="chart-axis-label" textAnchor="end">{xMax.toFixed(0)}</text>
-      <text x={PAD.left - 8} y={PAD.top + 5} className="chart-axis-label" textAnchor="end">{yMax.toFixed(1)}</text>
-      <text x={PAD.left - 8} y={HEIGHT - PAD.bottom} className="chart-axis-label" textAnchor="end">{yMin.toFixed(1)}</text>
 
       <text
         x={PAD.left + (WIDTH - PAD.left - PAD.right) / 2}

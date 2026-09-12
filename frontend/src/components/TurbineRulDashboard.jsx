@@ -60,6 +60,7 @@ export default function TurbineRulDashboard() {
 
       {sim.result ? (
         <SimulationResults
+          rows={sim.rows}
           pagedRows={sim.pagedRows}
           rowsCount={sim.rows.length}
           page={sim.page}
