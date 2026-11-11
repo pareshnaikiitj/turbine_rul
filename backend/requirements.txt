@@ -15,8 +15,9 @@ xgboost>=1.7
 torch>=2.0          # PyTorch — install separately via pytorch.org for GPU
 
 # ── AutoML (Three-Layer Stacked Ensemble) ───────────────
-autogluon.tabular[all]==1.5.0   # needs Python 3.10–3.12; install with the CPU
-                                # PyTorch index (see start_backend.sh)
+# Optional — listed in requirements-autogluon.txt. start_backend.sh installs it
+# only when the server can run it (Python 3.10–3.12 and ~4 GB RAM); otherwise
+# the backend automatically uses the RandomForest fallback.
 
 # ── HPO & Tuning ────────────────────────────────────────
 # optuna>=3.0       # Uncomment Phase 3: Bayesian HPO

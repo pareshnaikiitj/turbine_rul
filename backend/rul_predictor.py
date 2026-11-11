@@ -647,6 +647,7 @@ def train_final_model(X_train, y_train, X_test, y_test):
                     num_bag_folds=5,
                 )
     except ImportError:
+        log.info("AutoGluon is not installed; using the RandomForest model.")
         from sklearn.ensemble import RandomForestRegressor
 
         rf = RandomForestRegressor(n_estimators=200, random_state=CONFIG["random_state"], n_jobs=-1)

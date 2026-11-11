@@ -163,6 +163,48 @@ echo "the temporary filesystem."
     --index-url https://download.pytorch.org/whl/cpu
 
 # ------------------------------------------------------------
+# 7b. Optional AutoGluon (three-layer stacked ensemble)
+#
+# Installed only when this machine can run it. If it is skipped
+# or fails, the backend starts anyway and uses RandomForest.
+#
+#   INSTALL_AUTOGLUON=auto  (default) install if Python 3.10-3.12
+#                           and at least ~3.5 GB RAM
+#   INSTALL_AUTOGLUON=1     always try to install
+#   INSTALL_AUTOGLUON=0     never install
+# ------------------------------------------------------------
+INSTALL_AUTOGLUON="${INSTALL_AUTOGLUON:-auto}"
+PY_MINOR="$("$VENV_PYTHON" -c 'import sys; print(sys.version_info.minor)')"
+PY_MAJOR="$("$VENV_PYTHON" -c 'import sys; print(sys.version_info.major)')"
+MEM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+
+want_ag=0
+reason=""
+if [[ "$INSTALL_AUTOGLUON" == "1" ]]; then
+    want_ag=1
+elif [[ "$INSTALL_AUTOGLUON" == "0" ]]; then
+    reason="INSTALL_AUTOGLUON=0"
+elif [[ "$PY_MAJOR" -ne 3 || "$PY_MINOR" -lt 10 || "$PY_MINOR" -gt 12 ]]; then
+    reason="Python $PY_MAJOR.$PY_MINOR is not supported by AutoGluon (needs 3.10-3.12)"
+elif [[ "$MEM_MB" -lt 3500 ]]; then
+    reason="only ${MEM_MB} MB RAM (AutoGluon needs about 4 GB)"
+else
+    want_ag=1
+fi
+
+echo
+if [[ "$want_ag" -eq 1 ]]; then
+    echo "Installing optional AutoGluon..."
+    if ! "$VENV_PIP" install --no-cache-dir -r "$BACKEND_DIR/requirements-autogluon.txt" \
+            --extra-index-url https://download.pytorch.org/whl/cpu; then
+        echo "WARNING: AutoGluon install failed; the backend will use RandomForest."
+    fi
+else
+    echo "Skipping AutoGluon: $reason."
+    echo "The backend will use the RandomForest model."
+fi
+
+# ------------------------------------------------------------
 # 8. Verify important dependencies
 # ------------------------------------------------------------
 echo
@@ -183,7 +225,6 @@ packages = [
     ("uvicorn", "uvicorn"),
     ("multipart", "python-multipart"),
     ("torch", "torch"),
-    ("autogluon.tabular", "autogluon.tabular"),
 ]
 
 failed = []
@@ -206,6 +247,12 @@ if failed:
 import torch
 print(f"\nPyTorch device check: CUDA available = {torch.cuda.is_available()}")
 print("All required dependencies imported successfully.")
+
+try:
+    import autogluon.tabular as ag
+    print(f"\nModel: AutoGluon {getattr(ag, '__version__', '')} available -> three-layer stacked ensemble")
+except Exception:
+    print("\nModel: AutoGluon not installed -> RandomForest fallback")
 PY
 
 # ------------------------------------------------------------

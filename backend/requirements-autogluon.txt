@@ -1,0 +1,7 @@
+# Optional: AutoGluon three-layer stacked ensemble.
+# Requires Python 3.10–3.12 and about 4 GB RAM. Without it, the backend uses
+# the RandomForest fallback automatically.
+#
+# Install (CPU-only PyTorch):
+#   pip install -r requirements-autogluon.txt --extra-index-url https://download.pytorch.org/whl/cpu
+autogluon.tabular[all]==1.5.0
