@@ -75,7 +75,7 @@ export default function CsvUploadPredictions({
                       <td>{row.vibration}</td>
                       <td>{row.pressure}</td>
                       {'actual_rul_hours' in row ? <td>{row.actual_rul_hours} hrs</td> : null}
-                      <td>{row.predicted_rul_hours} hrs</td>
+                      <td>{Number(row.predicted_rul_hours).toFixed(2)} hrs</td>
                       <td>{row.health_score}</td>
                       <td>
                         <span className={`health-chip ${toneClass[row.status] || ''}`}>{row.status}</span>

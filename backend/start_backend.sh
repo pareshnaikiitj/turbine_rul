@@ -133,7 +133,10 @@ grep -vE '^[[:space:]]*torch([<=>~!].*)?([[:space:]]*#.*)?$' \
 
 echo
 echo "Installing requirements.txt dependencies (excluding torch)..."
-"$VENV_PIP" install --no-cache-dir -r "$BACKEND_DIR/requirements.runtime.tmp"
+# The CPU PyTorch index lets AutoGluon's torch dependency resolve to the
+# CPU-only build instead of the large CUDA build from PyPI.
+"$VENV_PIP" install --no-cache-dir -r "$BACKEND_DIR/requirements.runtime.tmp" \
+    --extra-index-url https://download.pytorch.org/whl/cpu
 
 # ------------------------------------------------------------
 # 6. FastAPI file uploads
@@ -180,6 +183,7 @@ packages = [
     ("uvicorn", "uvicorn"),
     ("multipart", "python-multipart"),
     ("torch", "torch"),
+    ("autogluon.tabular", "autogluon.tabular"),
 ]
 
 failed = []
